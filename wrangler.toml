@@ -1,0 +1,49 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Cloudflare Wrangler config for the Telegram Rich Markdown Bot worker (v2).
+# Deploy with:  wrangler deploy
+# ──────────────────────────────────────────────────────────────────────────────
+name = "telegram-rich-markdown-bot"
+main = "worker.js"
+compatibility_date = "2024-09-25"
+compatibility_flags = ["nodejs_compat"]
+
+# ─── KV namespace binding ─────────────────────────────────────────────────────
+# The bot stores admins / channels / AI config / scheduled posts / polls here.
+#
+# 1. Create it once:
+#      wrangler kv:namespace create BOT_DB
+# 2. Paste the returned `id` below (and `preview_id` for `wrangler dev`).
+[[kv_namespaces]]
+binding = "BOT_DB"
+id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+# preview_id = "REPLACE_WITH_YOUR_KV_PREVIEW_NAMESPACE_ID"
+
+# ─── Cron trigger — fires the `scheduled` event every 5 minutes ───────────────
+# This is REQUIRED for the AI scheduled-posts feature to work (posts created
+# with /scheduleai are stored in KV and sent by the cron tick when due).
+# If you don't need scheduled AI posts, you can comment this out.
+[triggers]
+crons = ["*/5 * * * *"]
+
+# ─── Optional secrets / vars ──────────────────────────────────────────────────
+# All values fall back to safe defaults baked into worker.js, so you can deploy
+# immediately without setting anything. Override only what you want to change.
+#
+# Set as SECRETS (recommended for tokens / API keys):
+#   wrangler secret put BOT_TOKEN
+#   wrangler secret put OWNER_ID
+#   wrangler secret put WEBHOOK_SECRET
+#   wrangler secret put AI_API_KEY
+#   wrangler secret put WEB_APP_URL
+#
+# Or set as plain VARS (not recommended for secrets):
+# [vars]
+# AI_PROVIDER = "groq"                          # openai|groq|together|openrouter|custom
+# AI_MODEL = "llama-3.3-70b-versatile"
+# AI_BASE_URL = "https://api.groq.com/openai/v1"
+# COBALT_API_URL = "https://api.cobalt.tools"   # self-host for reliability
+# WEB_APP_URL = "https://your-panel.example.com" # HTTPS required for Web App
+
+# ─── Observability ────────────────────────────────────────────────────────────
+[observability]
+enabled = true

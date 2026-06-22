@@ -1,0 +1,75 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Cloudflare Pages / Workers config for the Next.js admin panel.
+#
+# This file is used by `wrangler deploy` (via @opennextjs/cloudflare) to publish
+# the Next.js app to Cloudflare's edge network. It is SEPARATE from the
+# `wrangler.toml` used by the Telegram bot Worker — that one lives at the
+# project root and deploys `worker.js`. This one deploys the panel.
+#
+# Deploy commands (run from the project root):
+#
+#   1. bun run pages:build         # builds .open-next/ via OpenNext
+#   2. bun run pages:deploy        # publishes .open-next/ to Cloudflare
+#
+# Before the first deploy, create the D1 database + KV namespace:
+#
+#   npx wrangler d1 create telegram-bot-panel
+#   npx wrangler kv:namespace create NEXT_CACHE_WORKERS
+#
+# Then paste the returned `id` values into the bindings below.
+# ──────────────────────────────────────────────────────────────────────────────
+
+name = "telegram-bot-panel"
+main = ".open-next/worker.js"
+compatibility_date = "2024-09-25"
+compatibility_flags = ["nodejs_compat"]
+
+# Assets (static files from the Next.js build) — OpenNext emits them here.
+assets = { directory = ".open-next/assets", binding = "ASSETS" }
+
+# ─── D1 database binding (replaces local SQLite in production) ────────────────
+# The panel's Prisma client uses this binding via @prisma/adapter-d1.
+# Create it once:
+#   npx wrangler d1 create telegram-bot-panel
+# Then paste the returned `database_id` below.
+[[d1_databases]]
+binding = "DB"
+database_name = "telegram-bot-panel"
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+
+# ─── KV namespace for Next.js incremental cache (optional, for ISR) ───────────
+# Only needed if you enable `incrementalCache: " Workers"` in open-next.config.ts.
+# Create it once:
+#   npx wrangler kv:namespace create NEXT_CACHE_WORKERS
+# Then paste the returned `id` below.
+# [[kv_namespaces]]
+# binding = "NEXT_CACHE_WORKERS"
+# id = "REPLACE_WITH_YOUR_KV_ID"
+
+# ─── Environment variables (non-secret) ──────────────────────────────────────
+# These are visible to the panel at runtime via `getRequestContext().env`.
+# Set secrets (panel password, bot token, etc.) with `wrangler secret put`.
+[vars]
+NODE_ENV = "production"
+NEXT_PUBLIC_DEPLOY_TARGET = "cloudflare"
+
+# ─── Secrets (set via `wrangler secret put <NAME>`, do NOT put values here) ──
+# Required secrets for the panel:
+#   wrangler secret put PANEL_PASSWORD        # admin login password (default: admin123)
+#   wrangler secret put BOT_TOKEN             # shared with the Worker — same bot
+#   wrangler secret put PANEL_SESSION_SECRET  # random 32+ char string for cookie signing
+#
+# Optional secrets:
+#   wrangler secret put WEB_APP_URL           # public URL of THIS panel (e.g. https://panel.example.com)
+#   wrangler secret put TELEGRAM_BOT_TOKEN    # alias for BOT_TOKEN (panel uses whichever is set)
+
+# ─── Observability ────────────────────────────────────────────────────────────
+[observability]
+enabled = true
+
+# ─── Routes / custom domain (optional) ───────────────────────────────────────
+# By default the panel is served at https://telegram-bot-panel.<your-subdomain>.workers.dev
+# To use a custom domain, add a route here and configure the DNS in the Cloudflare dashboard.
+# routes = [
+#   { pattern = "panel.example.com/*", zone_name = "example.com" }
+# ]

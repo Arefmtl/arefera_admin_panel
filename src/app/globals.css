@@ -1,0 +1,743 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+:root {
+  --radius: 0.75rem;
+  --radius-lg: 0.75rem;
+  --shadow-card: 0 1px 3px 0 rgba(0,0,0,0.06), 0 1px 2px -1px rgba(0,0,0,0.06);
+  --shadow-card-hover: 0 10px 25px -5px rgba(0,0,0,0.08), 0 8px 10px -6px rgba(0,0,0,0.04);
+  --background: oklch(0.99 0.004 160);
+  --foreground: oklch(0.18 0.02 165);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.18 0.02 165);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.18 0.02 165);
+  --primary: oklch(0.58 0.14 162);
+  --primary-foreground: oklch(0.99 0.01 160);
+  --secondary: oklch(0.96 0.012 162);
+  --secondary-foreground: oklch(0.3 0.05 165);
+  --muted: oklch(0.96 0.008 160);
+  --muted-foreground: oklch(0.5 0.02 165);
+  --accent: oklch(0.94 0.04 165);
+  --accent-foreground: oklch(0.3 0.08 162);
+  --destructive: oklch(0.577 0.245 27.325);
+  --border: oklch(0.91 0.012 162);
+  --input: oklch(0.91 0.012 162);
+  --ring: oklch(0.58 0.14 162);
+  --chart-1: oklch(0.58 0.14 162);
+  --chart-2: oklch(0.7 0.13 184);
+  --chart-3: oklch(0.76 0.16 84);
+  --chart-4: oklch(0.64 0.22 16);
+  --chart-5: oklch(0.55 0.18 303);
+  --sidebar: oklch(0.19 0.02 170);
+  --sidebar-foreground: oklch(0.95 0.01 160);
+  --sidebar-primary: oklch(0.62 0.15 162);
+  --sidebar-primary-foreground: oklch(0.99 0.01 160);
+  --sidebar-accent: oklch(0.26 0.03 168);
+  --sidebar-accent-foreground: oklch(0.95 0.01 160);
+  --sidebar-border: oklch(0.28 0.02 168);
+  --sidebar-ring: oklch(0.55 0.15 162);
+}
+
+.dark {
+  --radius-lg: 0.75rem;
+  --shadow-card: 0 1px 3px 0 rgba(0,0,0,0.2), 0 1px 2px -1px rgba(0,0,0,0.2);
+  --shadow-card-hover: 0 10px 25px -5px rgba(0,0,0,0.3), 0 8px 10px -6px rgba(0,0,0,0.2);
+  --background: oklch(0.16 0.015 170);
+  --foreground: oklch(0.97 0.01 160);
+  --card: oklch(0.21 0.02 168);
+  --card-foreground: oklch(0.97 0.01 160);
+  --popover: oklch(0.21 0.02 168);
+  --popover-foreground: oklch(0.97 0.01 160);
+  --primary: oklch(0.7 0.15 162);
+  --primary-foreground: oklch(0.12 0.02 168);
+  --secondary: oklch(0.27 0.025 168);
+  --secondary-foreground: oklch(0.95 0.01 160);
+  --muted: oklch(0.25 0.018 168);
+  --muted-foreground: oklch(0.7 0.02 165);
+  --accent: oklch(0.3 0.04 165);
+  --accent-foreground: oklch(0.95 0.02 162);
+  --destructive: oklch(0.7 0.2 22);
+  --border: oklch(0.3 0.02 168);
+  --input: oklch(0.27 0.02 168);
+  --ring: oklch(0.6 0.15 162);
+  --chart-1: oklch(0.7 0.15 162);
+  --chart-2: oklch(0.7 0.13 184);
+  --chart-3: oklch(0.76 0.16 84);
+  --chart-4: oklch(0.65 0.22 16);
+  --chart-5: oklch(0.55 0.18 303);
+  --sidebar: oklch(0.13 0.02 172);
+  --sidebar-foreground: oklch(0.93 0.01 160);
+  --sidebar-primary: oklch(0.62 0.15 162);
+  --sidebar-primary-foreground: oklch(0.99 0.01 160);
+  --sidebar-accent: oklch(0.22 0.03 170);
+  --sidebar-accent-foreground: oklch(0.95 0.01 160);
+  --sidebar-border: oklch(0.24 0.02 170);
+  --sidebar-ring: oklch(0.55 0.15 162);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+}
+
+/* Refined custom scrollbars for admin lists/tables */
+@layer utilities {
+  .scrollbar-thin {
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+  }
+  .scrollbar-thin::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  .scrollbar-thin::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    background-color: color-mix(in oklch, var(--muted-foreground) 30%, transparent);
+    border-radius: 9999px;
+    border: 2px solid transparent;
+    background-clip: content-box;
+  }
+  .scrollbar-thin::-webkit-scrollbar-thumb:hover {
+    background-color: color-mix(in oklch, var(--muted-foreground) 50%, transparent);
+  }
+  .glass {
+    background: color-mix(in oklch, var(--card) 80%, transparent);
+    backdrop-filter: blur(12px);
+  }
+  /* Subtle background grid pattern for hero/empty areas */
+  .bg-grid {
+    background-image:
+      linear-gradient(to right, color-mix(in oklch, var(--border) 60%, transparent) 1px, transparent 1px),
+      linear-gradient(to bottom, color-mix(in oklch, var(--border) 60%, transparent) 1px, transparent 1px);
+    background-size: 24px 24px;
+  }
+  /* Emerald glow for status accents */
+  .glow-emerald {
+    box-shadow: 0 0 0 1px color-mix(in oklch, var(--primary) 30%, transparent),
+                0 4px 16px -2px color-mix(in oklch, var(--primary) 25%, transparent);
+  }
+  .animate-shimmer {
+    background: linear-gradient(90deg,
+      color-mix(in oklch, var(--muted) 50%, transparent) 0%,
+      color-mix(in oklch, var(--muted) 80%, transparent) 50%,
+      color-mix(in oklch, var(--muted) 50%, transparent) 100%);
+    background-size: 200% 100%;
+    animation: shimmer 1.5s ease-in-out infinite;
+  }
+}
+
+/* RTL (right-to-left) adjustments for Persian/Farsi */
+html[dir="rtl"] {
+  direction: rtl;
+}
+html[dir="rtl"] body {
+  font-family: var(--font-geist-sans), "Vazirmatn", "Tahoma", sans-serif;
+}
+/* Mirror sidebar to the right in RTL */
+html[dir="rtl"] .lg\:flex.flex-col.bg-sidebar {
+  border-right: none;
+  border-left: 1px solid var(--sidebar-border);
+}
+/* In RTL, the slide-in-from-left animation should become slide-in-from-right */
+html[dir="rtl"] .animate-in.slide-in-from-left {
+  --tw-enter-translate-x: 100%;
+}
+
+@keyframes shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+/* Fancy toast — emerald-accented with smooth slide-in */
+.toast_fancy {
+  animation: toast-slide-in 0.35s cubic-bezier(0.16, 1, 0.3, 1);
+}
+@keyframes toast-slide-in {
+  0% { transform: translateX(20px) scale(0.95); opacity: 0; }
+  100% { transform: translateX(0) scale(1); opacity: 1; }
+}
+
+/* Gradient mesh background utility — subtle emerald/teal radial blooms */
+.bg-mesh-emerald {
+  background-image:
+    radial-gradient(at 20% 20%, color-mix(in oklch, var(--primary) 8%, transparent) 0px, transparent 50%),
+    radial-gradient(at 80% 0%, color-mix(in oklch, #14b8a6 8%, transparent) 0px, transparent 50%),
+    radial-gradient(at 0% 80%, color-mix(in oklch, #06b6d4 6%, transparent) 0px, transparent 50%);
+}
+
+/* Animated gradient text — for hero numbers and brand accents */
+.text-gradient-emerald {
+  background: linear-gradient(120deg, #10b981, #14b8a6, #06b6d4);
+  background-size: 200% 200%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: gradient-flow 6s ease infinite;
+}
+@keyframes gradient-flow {
+  0%, 100% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+}
+
+/* Pulse-ring effect for live indicators */
+.pulse-ring::after {
+  content: "";
+  position: absolute;
+  inset: -3px;
+  border-radius: inherit;
+  background: inherit;
+  opacity: 0.6;
+  animation: pulse-ring 1.6s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  z-index: -1;
+}
+@keyframes pulse-ring {
+  0% { transform: scale(1); opacity: 0.6; }
+  100% { transform: scale(1.8); opacity: 0; }
+}
+
+/* Custom focus ring with emerald tint for keyboard accessibility */
+*:focus-visible {
+  outline: 2px solid color-mix(in oklch, var(--primary) 60%, transparent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* Smooth scrollbar styling for sidebar and lists */
+.scrollbar-thin {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in oklch, var(--muted-foreground) 30%, transparent) transparent;
+}
+.scrollbar-thin::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+.scrollbar-thin::-webkit-scrollbar-track {
+  background: transparent;
+}
+.scrollbar-thin::-webkit-scrollbar-thumb {
+  background: color-mix(in oklch, var(--muted-foreground) 30%, transparent);
+  border-radius: 3px;
+}
+.scrollbar-thin::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in oklch, var(--muted-foreground) 50%, transparent);
+}
+
+/* =========================================================================
+   Task 7-c additions — Channel Health Monitor + Dashboard/Analytics polish
+   ========================================================================= */
+
+/* Hover-lift utility — applied to cards that should lift on hover.
+   Emerald-tinted shadow bloom + border tint on hover. */
+.card-hover-lift {
+  transition: all 200ms ease;
+  border: 1px solid transparent;
+  will-change: transform;
+}
+.card-hover-lift:hover {
+  transform: translateY(-2px);
+  border-color: rgba(16, 185, 129, 0.3);
+  box-shadow:
+    0 8px 24px -12px rgba(16, 185, 129, 0.25),
+    0 10px 25px -5px color-mix(in oklch, var(--primary) 12%, transparent),
+    0 8px 10px -6px color-mix(in oklch, var(--primary) 8%, transparent);
+}
+.dark .card-hover-lift:hover {
+  border-color: rgba(52, 211, 153, 0.25);
+}
+
+/* Frosted glass card — semi-transparent with backdrop blur for layering.
+   Emerald-tinted border on hover for visual warmth. */
+.glass-card {
+  background-color: color-mix(in oklch, var(--card) 80%, transparent);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid color-mix(in oklch, var(--border) 60%, transparent);
+  box-shadow: 0 1px 2px 0 color-mix(in oklch, var(--foreground) 5%, transparent);
+  transition: border-color 300ms ease;
+}
+.glass-card:hover {
+  border-color: rgba(16, 185, 129, 0.2);
+}
+.dark .glass-card:hover {
+  border-color: rgba(52, 211, 153, 0.2);
+}
+
+/* Status dot — 6px rounded dot with emerald pulse animation for live indicators */
+.status-dot {
+  position: relative;
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 9999px;
+  background-color: #10b981;
+}
+.status-dot::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: #10b981;
+  animation: status-dot-pulse 1.6s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+.dark .status-dot {
+  background-color: #34d399;
+}
+.dark .status-dot::after {
+  background: #34d399;
+}
+@keyframes status-dot-pulse {
+  0% { transform: scale(1); opacity: 0.8; }
+  100% { transform: scale(2.4); opacity: 0; }
+}
+
+/* Status badge base class — consistent pill styling across status badges */
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  border-radius: 9999px;
+  padding: 0.125rem 0.625rem;
+  font-size: 0.75rem;
+  line-height: 1rem;
+  font-weight: 500;
+  border-width: 1px;
+  border-style: solid;
+  white-space: nowrap;
+}
+
+/* Skeleton shimmer — for loading placeholders. bg-[length:200%_100%] for smooth gradient slide. */
+.skeleton-shimmer {
+  background: linear-gradient(
+    90deg,
+    color-mix(in oklch, var(--muted) 60%, transparent) 0%,
+    color-mix(in oklch, var(--muted) 90%, transparent) 50%,
+    color-mix(in oklch, var(--muted) 60%, transparent) 100%
+  );
+  background-size: 200% 100%;
+  animation: skeleton-shimmer 1.4s ease-in-out infinite;
+}
+@keyframes skeleton-shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+/* Sidebar nav-item active state — emerald tint + left border accent */
+.nav-item-active {
+  background-color: color-mix(in oklch, var(--primary) 10%, transparent);
+  border-left-color: var(--primary);
+  color: color-mix(in oklch, var(--primary) 70%, var(--foreground));
+  font-weight: 500;
+}
+.nav-item-active:hover {
+  background-color: color-mix(in oklch, var(--primary) 15%, transparent);
+}
+
+/* Sidebar nav-item inactive state — muted with subtle hover */
+.nav-item-inactive {
+  border-left-color: transparent;
+  color: var(--muted-foreground);
+}
+.nav-item-inactive:hover {
+  background-color: color-mix(in oklch, var(--muted) 50%, transparent);
+  color: var(--foreground);
+}
+
+/* Horizontal scrollbar styling for the timeline view — emerald-tinted thumb */
+.timeline-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in oklch, var(--primary) 35%, transparent) transparent;
+}
+.timeline-scroll::-webkit-scrollbar {
+  height: 10px;
+  width: 10px;
+}
+.timeline-scroll::-webkit-scrollbar-track {
+  background: color-mix(in oklch, var(--muted) 30%, transparent);
+  border-radius: 9999px;
+}
+.timeline-scroll::-webkit-scrollbar-thumb {
+  background-color: color-mix(in oklch, var(--primary) 35%, transparent);
+  border-radius: 9999px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+.timeline-scroll::-webkit-scrollbar-thumb:hover {
+  background-color: color-mix(in oklch, var(--primary) 55%, transparent);
+}
+
+/* Fade-in-up keyframe — used by staggered card entrance animations */
+@keyframes fadeInUp {
+  0% {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.animate-fade-in-up {
+  animation: fadeInUp 0.35s ease-out both;
+}
+
+/* =========================================================================
+   Task 8-a additions — stronger active-tab indicator (emerald underline)
+   Targets shadcn TabsTrigger via [data-slot] + [data-state=active].
+   ========================================================================= */
+[data-slot="tabs-trigger"][data-state="active"] {
+  font-weight: 600;
+  position: relative;
+  color: color-mix(in oklch, var(--primary) 80%, var(--foreground));
+}
+[data-slot="tabs-trigger"][data-state="active"]::after {
+  content: "";
+  position: absolute;
+  left: 20%;
+  right: 20%;
+  bottom: 2px;
+  height: 2px;
+  border-radius: 9999px;
+  background: linear-gradient(
+    90deg,
+    color-mix(in oklch, var(--primary) 0%, transparent),
+    color-mix(in oklch, var(--primary) 80%, var(--foreground)) 50%,
+    color-mix(in oklch, var(--primary) 0%, transparent)
+  );
+}
+
+/* =========================================================================
+   Task 9-c additions — Global CSS overhaul utilities
+   ========================================================================= */
+
+/* Card glow — subtle emerald glow on hover */
+.card-glow {
+  transition: box-shadow 300ms ease;
+}
+.card-glow:hover {
+  box-shadow: 0 0 20px -5px rgba(16, 185, 129, 0.15);
+}
+.dark .card-glow:hover {
+  box-shadow: 0 0 20px -5px rgba(52, 211, 153, 0.12);
+}
+
+/* Badge pulse — for live/running status badges with a ping animation */
+.badge-pulse {
+  position: relative;
+}
+.badge-pulse::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 9999px;
+  background: currentColor;
+  opacity: 0.2;
+  animation: badge-ping 1.5s cubic-bezier(0, 0, 0.2, 1) infinite;
+}
+@keyframes badge-ping {
+  0% { transform: scale(1); opacity: 0.2; }
+  75%, 100% { transform: scale(1.8); opacity: 0; }
+}
+
+/* Gradient border — emerald-to-teal gradient border effect */
+.gradient-border {
+  border-image: linear-gradient(135deg, #10b981, #14b8a6) 1;
+}
+
+/* Shimmer — enhanced shimmer effect for loading states */
+.shimmer {
+  background: linear-gradient(
+    90deg,
+    color-mix(in oklch, var(--muted) 50%, transparent) 0%,
+    color-mix(in oklch, var(--muted) 80%, transparent) 50%,
+    color-mix(in oklch, var(--muted) 50%, transparent) 100%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 2s ease-in-out infinite;
+}
+
+/* Text balance — for headings to distribute text evenly across lines */
+.text-balance {
+  text-wrap: balance;
+}
+
+/* Scrollbar hide — hide scrollbar but keep scrollability */
+.scrollbar-hide {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.scrollbar-hide::-webkit-scrollbar {
+  display: none;
+}
+
+/* Ensure shimmer keyframes is properly defined */
+@keyframes shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+/* Sparkline draw animation for StatCard */
+@keyframes sparkline-draw {
+  to { stroke-dashoffset: 0; }
+}
+
+/* =========================================================================
+   Task 10-c additions — Calendar visual cues + tooltip arrows + message pills
+   ========================================================================= */
+
+/* Tooltip arrow — custom arrow styling for inline tooltips. */
+.tooltip-arrow {
+  position: absolute;
+  width: 8px;
+  height: 8px;
+  transform: rotate(45deg);
+  background: inherit;
+  z-index: -1;
+}
+
+/* Calendar day cell — today highlight (emerald ring + subtle bg). */
+.day-cell-today {
+  box-shadow: 0 0 0 2px color-mix(in oklch, var(--primary) 70%, transparent),
+              0 0 0 4px color-mix(in oklch, var(--background) 100%, transparent);
+  background-color: color-mix(in oklch, var(--primary) 8%, transparent);
+}
+
+/* Calendar day cell — has messages (subtle emerald tint). */
+.day-cell-has-messages {
+  background-color: color-mix(in oklch, var(--primary) 5%, transparent);
+}
+.day-cell-has-messages:hover {
+  background-color: color-mix(in oklch, var(--primary) 10%, transparent);
+}
+
+/* Calendar day cell — has failures (subtle rose tint). */
+.day-cell-has-failures {
+  background-color: color-mix(in oklch, #f43f5e 6%, transparent);
+}
+.day-cell-has-failures:hover {
+  background-color: color-mix(in oklch, #f43f5e 10%, transparent);
+}
+.dark .day-cell-has-failures {
+  background-color: color-mix(in oklch, #fb7185 10%, transparent);
+}
+.dark .day-cell-has-failures:hover {
+  background-color: color-mix(in oklch, #fb7185 16%, transparent);
+}
+
+/* Calendar message pill — base styling: min-h-8, rounded, padding. */
+.message-pill {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  min-height: 2rem;
+  padding: 0.25rem 0.5rem;
+  border-radius: 0.375rem;
+  font-size: 0.6875rem;
+  line-height: 1.125rem;
+  font-weight: 500;
+  width: 100%;
+  text-align: start;
+  transition: opacity 150ms ease, transform 150ms ease;
+  overflow: hidden;
+}
+.message-pill:hover {
+  opacity: 0.85;
+}
+.message-pill > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+}
+
+/* =========================================================================
+   Task 11-a additions — Mobile polish + truncation helpers + soft badges
+   ========================================================================= */
+
+/* 2-line truncation helper — works on webkit/firefox. Use on titles/labels
+   that need to clamp to at most 2 lines (e.g. channel names, schedule titles). */
+.truncate-2 {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+
+/* Soft emerald badge — for Owner / success / connected states.
+   Higher contrast than the default emerald-50 tint, with proper dark mode. */
+.badge-soft-emerald {
+  background-color: #d1fae5;
+  color: #047857;
+  border-color: #a7f3d0;
+}
+.dark .badge-soft-emerald {
+  background-color: rgba(6, 78, 59, 0.4);
+  color: #6ee7b7;
+  border-color: rgba(6, 95, 70, 0.7);
+}
+
+/* Soft rose badge — for warnings / errors / weak states. */
+.badge-soft-rose {
+  background-color: #ffe4e6;
+  color: #be123c;
+  border-color: #fecdd3;
+}
+.dark .badge-soft-rose {
+  background-color: rgba(76, 5, 25, 0.45);
+  color: #fda4af;
+  border-color: rgba(136, 19, 55, 0.7);
+}
+
+/* Soft amber badge — for pending / due states. */
+.badge-soft-amber {
+  background-color: #fef3c7;
+  color: #b45309;
+  border-color: #fde68a;
+}
+.dark .badge-soft-amber {
+  background-color: rgba(69, 26, 3, 0.45);
+  color: #fcd34d;
+  border-color: rgba(120, 53, 15, 0.7);
+}
+
+/* Mobile-stack helper — flex-col on mobile, flex-row on sm+.
+   Use on form rows / button rows that need to wrap on narrow viewports. */
+.mobile-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+@media (min-width: 640px) {
+  .mobile-stack {
+    flex-direction: row;
+    align-items: center;
+  }
+}
+
+/* Mobile-scroll helper — make chart containers horizontally scrollable on
+   narrow viewports so axis labels never truncate. */
+.mobile-scroll {
+  overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+}
+.mobile-scroll::-webkit-scrollbar {
+  height: 6px;
+}
+
+/* Empty state icon — larger, emerald-tinted visual.
+   Applied via parent selector so we don't have to touch shared.tsx. */
+.empty-state-icon-emerald > div:first-child {
+  background-color: color-mix(in oklch, var(--primary) 12%, transparent);
+}
+.empty-state-icon-emerald svg {
+  color: color-mix(in oklch, var(--primary) 70%, var(--foreground));
+}
+
+/* Topbar title — prevent over-truncation on mobile by allowing it to take
+   more horizontal space before ellipsing. Targets the h1 in the topbar. */
+@media (max-width: 640px) {
+  header h1.truncate {
+    min-width: 0;
+    flex: 1 1 auto;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+}
+
+/* Sidebar nav label — allow it to take available width without truncating
+   to gibberish like "Sch" on mobile drawers. */
+aside nav button span.truncate {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+/* ─── Telegram WebApp integration ─────────────────────────────────────────── */
+/* When the panel is opened inside Telegram, the SDK exposes the live viewport
+   height as --tg-vh (and the stable height as --tg-vh-stable). Use these in
+   components that need to fill the Telegram chrome exactly:
+       height: var(--tg-vh, 100dvh);
+   The fallback (100dvh) keeps things sensible on the open web. */
+
+:root {
+  --tg-vh: 100dvh;
+  --tg-vh-stable: 100dvh;
+}
+
+/* Disable the iOS/Telegram "rubber-band" overscroll when inside the WebApp,
+   and hide the page's own vertical scrollbar so it feels native. */
+html[data-tg-color-scheme] body {
+  overscroll-behavior-y: none;
+}
+
+/* Telegram theme palette — exposed as CSS vars by the provider. Any component
+   can opt-in with `color: var(--tg-text, var(--foreground));` etc. By default
+   we don't override the panel palette — this just makes the values available. */
+:root {
+  --tg-bg: #ffffff;
+  --tg-text: #0f172a;
+  --tg-hint: #64748b;
+  --tg-link: #2563eb;
+  --tg-button: #10b981;
+  --tg-button-text: #ffffff;
+  --tg-secondary-bg: #f1f5f9;
+  --tg-accent: #10b981;
+  --tg-section-bg: #f8fafc;
+  --tg-section-header: #64748b;
+  --tg-subtitle: #64748b;
+  --tg-destructive: #dc2626;
+}

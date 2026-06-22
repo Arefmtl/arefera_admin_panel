@@ -1,0 +1,140 @@
+// Prisma schema for the Telegram Bot Admin Panel
+// learn more: https://pris.ly/d/prisma-schema
+//
+// Driver adapters are enabled so the same Prisma Client works on:
+//   • Local dev  → file-based SQLite (env.DATABASE_URL = "file:./db/custom.db")
+//   • Production → Cloudflare D1 (the @prisma/adapter-d1 adapter is injected
+//                  in src/lib/db.ts when the D1 binding `env.DB` is present).
+// The `sqlite` provider below is correct for BOTH — D1 is wire-compatible
+// with SQLite, so no schema change is needed.
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["driverAdapters"]
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Admin {
+  id         String   @id @default(cuid())
+  telegramId String   @unique
+  name       String?
+  isOwner    Boolean  @default(false)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+}
+
+model Channel {
+  id         String   @id @default(cuid())
+  telegramId String   @unique
+  title      String
+  username   String?
+  type       String   @default("channel") // channel | group | chat
+  active     Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  logs ScheduledMessageLog[]
+}
+
+model Post {
+  id        String   @id @default(cuid())
+  text      String
+  format    String   @default("markdown") // markdown | html
+  buttons   String? // JSON array of rows of {text,url}
+  createdAt DateTime @default(now())
+}
+
+model ScheduledMessage {
+  id          String   @id @default(cuid())
+  title       String
+  text        String
+  format      String   @default("markdown") // markdown | html
+  buttons     String? // JSON
+  channelIds  String   @default("[]") // JSON array of Channel.id
+  scheduledAt DateTime
+  repeat      String   @default("none") // none | daily | weekly | monthly
+  status      String   @default("pending") // pending | sent | failed | cancelled | paused
+  lastRunAt   DateTime?
+  nextRunAt   DateTime?
+  error       String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  logs ScheduledMessageLog[]
+}
+
+model ScheduledMessageLog {
+  id           String   @id @default(cuid())
+  messageId    String
+  message      ScheduledMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  channelId    String
+  channel      Channel  @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  channelTitle String
+  success      Boolean
+  error        String?
+  ranAt        DateTime @default(now())
+}
+
+model Setting {
+  id    String @id
+  value String
+}
+
+model SavedView {
+  id        String   @id @default(cuid())
+  name      String
+  filters   String   // JSON string: { status, search, repeat }
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([updatedAt])
+}
+
+model Template {
+  id        String   @id @default(cuid())
+  name      String
+  text      String
+  format    String   @default("markdown") // markdown | html
+  buttons   String? // JSON array of rows of {text,url}
+  category  String   @default("general")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  action    String   // create | update | delete | cancel | clone | send | run | login | settings | pause | resume
+  entity    String   // scheduled | channel | admin | template | post | settings | broadcast
+  entityId  String?
+  title     String?
+  detail    String?
+  actor     String   @default("admin")
+  meta      String?  // JSON string with extra context
+  createdAt DateTime @default(now())
+
+  @@index([action])
+  @@index([entity])
+  @@index([createdAt])
+}
+
+/// Tracks every admin panel session issued by `login()`. The Session.id is
+/// the HMAC signature embedded in the `tg_admin_session` cookie, so we can
+/// look up a session by parsing the cookie without changing the cookie
+/// format. Rows are kept (with `active=false`) after revocation so the
+/// audit trail of IP/UA + lastSeenAt is preserved.
+model Session {
+  id         String   @id // the HMAC signature from the cookie (no cuid default)
+  createdAt  DateTime @default(now())
+  lastSeenAt DateTime @default(now())
+  expiresAt  DateTime
+  ip         String?
+  userAgent  String?
+  active     Boolean  @default(true)
+
+  @@index([active])
+  @@index([expiresAt])
+}
