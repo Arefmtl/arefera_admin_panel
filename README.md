@@ -182,9 +182,6 @@ bun add -g wrangler
 4. یه **username** بدید که آخرش `bot` باشه (مثلاً `my_awesome_bot`)
 5. BotFather بهتون **Bot Token** می‌ده — این رو ذخیره کنید:
 
-```
-1234567890:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw
-```
 
 > ⚠️ **هیچ‌کس** این توکن رو نبینه — هرکسی این رو داشته باشه می‌تونه رباتتون رو کنترل کنه!
 
