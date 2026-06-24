@@ -36,10 +36,10 @@
 
 | بخش | توضیح ساده |
 |------|------------|
-| 🤖 **ربات تلگرام** | یک ربات تلگرام که کاربرها باهاش حرف می‌زنن. می‌تونه محتوا با AI بسازه، از یوتیوب/گیت‌هاب دانلود کنه، نظرسنجی برگزار کنه. |
-| 🌐 **پنل ادمین** | یک سایت وب که شما (به‌عنوان مدیر ربات) بازش می‌کنید تا پیام‌های زمان‌بندی‌شده بسازید، کانال‌ها مدیریت کنید، آمار ببینید. |
+| 🤖 **ربات تلگرام** | یک ربات تلگرام که کاربرها باهاش حرف می‌زنن. می‌تونه محتوا با AI بسازه، از یوتیوب/گیت‌هاب دانلود کنه، نظرسنجی بگیره، آمار بده. |
+| 🌐 **پنل ادمین** | یک سایت وب که شما (به‌عنوان مدیر ربات) بازش می‌کنید تا پیام‌های زمان‌بندی‌شده بسازید، کانال مدیریت کنید، آمار ببینید. |
 
-**نکته جذاب:** پنل ادمین رو می‌تونید از داخل خود تلگرام باز کنید (به‌صورت یک Mini App) — نیازی نیست URL جداگانه‌ای در مرورگر باز کنید.
+**نکته جذاب:** پنل ادمین رو می‌تونید از داخل خود تلگرام باز کنید (به‌صورت یک Mini App) — نیازی نیست URL جداگانه‌ای در مرورگر باز کنید!
 
 هر دو بخش روی **[Cloudflare](https://www.cloudflare.com/)** اجرا می‌شن — یعنی:
 - ⚡ سریع (سرورهای خود Cloudflare در سراسر دنیا)
@@ -134,8 +134,8 @@ CSS: 2.1%         (استایل‌ها)
 ## 📋 پیش‌نیازها
 
 ### ۱. ربات تلگرام
-- به [@BotFather](https://t.me/BotFather) برید و یا `/newbot` بفرستید
-- **Bot Token** بگیرید (مثل `123456789:ABCdefGhi...`)
+- به [@BotFather](https://t.me/BotFather) برید و `/newbot` بفرستید
+- **Bot Token** بگیرید (بعداً در Secrets ذخیره می‌کنید)
 
 ### ۲. Telegram User ID
 - به [@userinfobot](https://t.me/userinfobot) پیام بدید
@@ -195,18 +195,29 @@ wrangler kv:namespace create BOT_DB
 
 ### گام ۴: Secrets
 
+**⚠️ هرگز Secrets رو در فایل‌های Git ذخیره نکنید!**
+
 ```bash
-# Bot Token
-echo "1234567890:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw" | wrangler secret put BOT_TOKEN
+# Bot Token (از @BotFather)
+wrangler secret put BOT_TOKEN
 
-# Owner ID
-echo "123456789" | wrangler secret put OWNER_ID
+# Owner ID (Telegram User ID شما)
+wrangler secret put OWNER_ID
 
-# پسورد پنل
-echo "strong-password-123" | wrangler secret put PANEL_PASSWORD --config wrangler.pages.toml
+# پسورد پنل (رمز قوی بسازید)
+wrangler secret put PANEL_PASSWORD --config wrangler.pages.toml
 
-# Session Secret
+# Session Secret (برای encryption cookies)
 openssl rand -hex 32 | wrangler secret put PANEL_SESSION_SECRET --config wrangler.pages.toml
+
+# Webhook Secret (برای تأیید درخواست‌های Telegram)
+openssl rand -hex 32 | wrangler secret put WEBHOOK_SECRET
+
+# [اختیاری] AI API Key
+wrangler secret put AI_API_KEY
+
+# [اختیاری] Web App URL
+wrangler secret put WEB_APP_URL
 ```
 
 ### گام ۵: دیپلوی
@@ -219,7 +230,7 @@ bun run pages:deploy
 wrangler deploy
 
 # Setup Webhook
-curl "https://your-worker.workers.dev/setup-webhook"
+curl "https://your-worker-name.workers.dev/setup-webhook"
 ```
 
 ### گام ۶: تست
@@ -270,12 +281,12 @@ curl "https://your-worker.workers.dev/setup-webhook"
 | 🔍 Lint | `bun run lint` |
 | 🌐 Build Panel | `bun run pages:build` |
 | 🚀 Deploy Panel | `bun run pages:deploy` |
-| 🤖 Deploy Bot | `wrangler deploy` |
+| ��� Deploy Bot | `wrangler deploy` |
 | 📊 Migrate DB | `bun run d1:migrate:prod` |
 | 📜 View Logs | `wrangler tail` |
 | 🔍 Query DB | `wrangler d1 execute telegram-bot-panel --remote --command "SELECT * FROM Admin"` |
-| ⚙️ Setup Webhook | `curl https://your-worker.workers.dev/setup-webhook` |
-| 🏥 Health Check | `curl https://your-worker.workers.dev/health` |
+| ⚙️ Setup Webhook | `curl https://your-worker-name.workers.dev/setup-webhook` |
+| 🏥 Health Check | `curl https://your-worker-name.workers.dev/health` |
 
 ---
 
@@ -314,8 +325,8 @@ bun run d1:migrate:prod
 ۱. `/revoke` در [@BotFather](https://t.me/BotFather)
 ۲. توکن جدید ست کنید:
 ```bash
-echo "NEW_TOKEN" | wrangler secret put BOT_TOKEN
-echo "NEW_TOKEN" | wrangler secret put BOT_TOKEN --config wrangler.pages.toml
+wrangler secret put BOT_TOKEN
+wrangler secret put BOT_TOKEN --config wrangler.pages.toml
 ```
 ۳. دوباره دیپلوی کنید
 
@@ -347,10 +358,10 @@ bun run d1:migrate:prod
 
 ```bash
 # چک کنید:
-curl https://your-worker.workers.dev/health
+curl https://your-worker-name.workers.dev/health
 
 # Setup مجدد:
-curl https://your-worker.workers.dev/setup-webhook
+curl https://your-worker-name.workers.dev/setup-webhook
 
 # لاگ‌ها:
 wrangler tail
@@ -370,7 +381,7 @@ wrangler tail
 ### ✅ اقدامات شده
 
 - 🔒 HTTPS اجباری
-- 🔑 Bot Token به‌صورت Secret
+- 🔑 Bot Token به‌صورت Secret (هرگز در کد نیست)
 - 🧂 Password Hash (SHA-256 + salt)
 - 🍪 Secure Cookies
 - 🛡️ 2FA (TOTP)
@@ -380,10 +391,11 @@ wrangler tail
 
 ### ⚠️ کارهایی که شما باید انجام بدید
 
-- [ ] پسورد `admin123` رو عوض کنید
+- [ ] پسورد را یک رمز قوی انتخاب کنید
 - [ ] 2FA فعال کنید
-- [ ] `.env` رو به Git پوش نکنید
+- [ ] `.env.local` یا `.env` رو به `.gitignore` اضافه کنید
 - [ ] Bot Token رو با کسی نشریید
+- [ ] Secrets رو هرگز در GitHub نگذارید
 
 ---
 
