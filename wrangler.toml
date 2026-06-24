@@ -15,7 +15,7 @@ compatibility_flags = ["nodejs_compat"]
 # 2. Paste the returned `id` below (and `preview_id` for `wrangler dev`).
 [[kv_namespaces]]
 binding = "BOT_DB"
-id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+id = "2f3028151ce44fcf8da3d6da9f9ded45"
 # preview_id = "REPLACE_WITH_YOUR_KV_PREVIEW_NAMESPACE_ID"
 
 # ─── Cron trigger — fires the `scheduled` event every 5 minutes ───────────────
