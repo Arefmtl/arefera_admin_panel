@@ -4,7 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "next dev -p 3000 2>&1 | tee dev.log",
-    "build": "next build && cp -r .next/static .next/standalone/.next/ && cp -r public .next/standalone/",
+    "build": "next build && node -e \"const fs=require('fs');const p=require('path');function c(s,d){fs.mkdirSync(d,{recursive:true});for(const f of fs.readdirSync(s,{withFileTypes:true})){const sp=p.join(s,f.name),dp=p.join(d,f.name);f.isDirectory()?c(sp,dp):fs.copyFileSync(sp,dp)}}c('.next/static','.next/standalone/.next/static');c('public','.next/standalone/public');\"",
     "start": "NODE_ENV=production bun .next/standalone/server.js 2>&1 | tee server.log",
     "lint": "eslint .",
     "db:push": "prisma db push",

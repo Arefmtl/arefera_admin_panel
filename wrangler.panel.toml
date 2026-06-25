@@ -1,0 +1,19 @@
+name = "telegram-bot-panel"
+main = "panel-worker.js"
+compatibility_date = "2024-09-25"
+compatibility_flags = ["nodejs_compat"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "telegram-bot-panel"
+database_id = "0b293080-1e72-4fcc-b922-b5c47e77afc7"
+
+[[kv_namespaces]]
+binding = "BOT_DB"
+id = "2f3028151ce44fcf8da3d6da9f9ded45"
+
+[vars]
+NODE_ENV = "production"
+
+[observability]
+enabled = true

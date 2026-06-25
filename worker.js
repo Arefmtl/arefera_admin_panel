@@ -77,6 +77,14 @@
  *      env.AI_MODEL         → model name                  (default: by provider)
  *      env.AI_SYSTEM_PROMPT → system prompt               (default: content-writer)
  *      env.COBALT_API_URL   → cobalt instance URL         (default: public instance)
+ *      env.RAPIDAPI_KEY     → RapidAPI key (generic, all platforms)
+ *      env.RAPIDAPI_YOUTUBE_KEY   → YouTube-specific key (overrides generic)
+ *      env.RAPIDAPI_TIKTOK_KEY    → TikTok-specific key
+ *      env.RAPIDAPI_IG_KEY        → Instagram-specific key
+ *      env.RAPIDAPI_TWITTER_KEY   → Twitter/X-specific key
+ *      env.RAPIDAPI_FB_KEY        → Facebook-specific key
+ *      env.RAPIDAPI_REDDIT_KEY    → Reddit-specific key
+ *      env.RAPIDAPI_PINTEREST_KEY → Pinterest-specific key
  *
  *  KV overrides env for AI config: /aiconfig /aimodel /aisystem store in KV
  *  and take precedence over env vars.
@@ -114,6 +122,110 @@ const DEFAULT_OWNER_ID  = 1278759197;
 
 // AI provider defaults — baseUrl + model per provider. The /aiconfig command
 // stores a full config object in KV (key "ai_config") which overrides these.
+// ─── Timezone offset (Iran = UTC+3:30) ─────────────────────────────────────
+const TIMEZONE_OFFSET_MS = 3.5 * 60 * 60 * 1000; // 3 hours 30 minutes in ms
+
+// ─── In-memory KV cache ─────────────────────────────────────────────────────
+// Reduces KV reads by caching frequently accessed data in memory.
+// Cache is per-worker instance and resets on cold start.
+const kvCache = new Map();
+const KV_CACHE_TTL = 60 * 1000; // 60 seconds default
+
+// ─── Keyboard cache ──────────────────────────────────────────────────────────
+// Static keyboards are recreated every call. Cache them to reduce GC pressure.
+const kbCache = new Map();
+function cachedKeyboard(key, builder) {
+  if (kbCache.has(key)) return kbCache.get(key);
+  const kb = builder();
+  kbCache.set(key, kb);
+  return kb;
+}
+
+/**
+ * Read from KV with in-memory caching.
+ * @param {Object} env - Worker env with BOT_DB binding
+ * @param {string} key - KV key
+ * @param {string} type - "json" | "text" | "arrayBuffer" | "stream"
+ * @param {number} ttl - Cache TTL in ms (default 60s)
+ * @returns {Promise<any>}
+ */
+async function cachedGet(env, key, type = "json", ttl = KV_CACHE_TTL) {
+  const cacheKey = `${key}:${type}`;
+  const cached = kvCache.get(cacheKey);
+  if (cached && Date.now() - cached.ts < ttl) return cached.value;
+
+  const value = await env.BOT_DB.get(key, type);
+  kvCache.set(cacheKey, { value, ts: Date.now() });
+  return value;
+}
+
+/**
+ * Write to KV and invalidate cache for that key.
+ */
+async function cachedPut(env, key, value, type = "json") {
+  const str = type === "json" ? JSON.stringify(value) : value;
+  await env.BOT_DB.put(key, str);
+  kvCache.delete(`${key}:json`);
+  kvCache.delete(`${key}:text`);
+}
+
+/**
+ * Delete from KV and invalidate cache.
+ */
+async function cachedDelete(env, key) {
+  await env.BOT_DB.delete(key);
+  kvCache.delete(`${key}:json`);
+  kvCache.delete(`${key}:text`);
+}
+
+/**
+ * Clear all cache (use after bulk operations).
+ */
+function clearCache() {
+  kvCache.clear();
+}
+
+function parseLocalTime(text) {
+  // Try relative: "in 2h", "in 30m", "in 1d"
+  const relMatch = text.match(/^in\s+(\d+)\s*(m|min|minutes?|h|hr|hours?|d|days?)$/i);
+  if (relMatch) {
+    const num = parseInt(relMatch[1], 10);
+    const unit = relMatch[2].toLowerCase();
+    const mult = unit.startsWith("m") ? 60000 : unit.startsWith("h") ? 3600000 : 86400000;
+    return Date.now() + num * mult;
+  }
+  
+  // Try ISO-like: "2026-06-26 00:30" or "2026-06-26T00:30"
+  const m1 = text.match(/^(\d{4})-(\d{2})-(\d{2})[\s T]+(\d{2}):(\d{2})/);
+  if (m1) {
+    const localMs = new Date(`${m1[1]}-${m1[2]}-${m1[3]}T${m1[4]}:${m1[5]}:00`).getTime();
+    return localMs - TIMEZONE_OFFSET_MS;
+  }
+  
+  // Try "2026-Jun-26 00:30" format
+  const monthNames = { jan: "01", feb: "02", mar: "03", apr: "04", may: "05", jun: "06", jul: "07", aug: "08", sep: "09", oct: "10", nov: "11", dec: "12" };
+  const m2 = text.match(/^(\d{4})-([A-Za-z]{3})-(\d{2})\s+(\d{2}):(\d{2})/);
+  if (m2) {
+    const monthNum = monthNames[m2[2].toLowerCase()];
+    if (monthNum) {
+      const localMs = new Date(`${m2[1]}-${monthNum}-${m2[3]}T${m2[4]}:${m2[5]}:00`).getTime();
+      return localMs - TIMEZONE_OFFSET_MS;
+    }
+  }
+  
+  // Try "26 Jun 2026 00:30" format
+  const m3 = text.match(/^(\d{2})\s+([A-Za-z]{3})\s+(\d{4})\s+(\d{2}):(\d{2})/);
+  if (m3) {
+    const monthNum = monthNames[m3[2].toLowerCase()];
+    if (monthNum) {
+      const localMs = new Date(`${m3[3]}-${monthNum}-${m3[1]}T${m3[4]}:${m3[5]}:00`).getTime();
+      return localMs - TIMEZONE_OFFSET_MS;
+    }
+  }
+  
+  return null;
+}
+
 const AI_PROVIDER_DEFAULTS = {
   openai:    { baseUrl: "https://api.openai.com/v1",          model: "gpt-4o-mini" },
   groq:      { baseUrl: "https://api.groq.com/openai/v1",     model: "llama-3.3-70b-versatile" },
@@ -136,12 +248,47 @@ function getConfig(env) {
   const secret = (env && env.WEBHOOK_SECRET && String(env.WEBHOOK_SECRET).trim()) || "";
   const webAppUrl = (env && env.WEB_APP_URL && String(env.WEB_APP_URL).trim()) || "";
   const cobaltUrl = (env && env.COBALT_API_URL && String(env.COBALT_API_URL).trim()) || "https://api.cobalt.tools";
+
+  // RapidAPI config — generic key + optional per-platform overrides
+  const rapidApiKey = (env && env.RAPIDAPI_KEY && String(env.RAPIDAPI_KEY).trim()) || "";
+  const rapidApiYoutubeKey = (env && env.RAPIDAPI_YOUTUBE_KEY && String(env.RAPIDAPI_YOUTUBE_KEY).trim()) || "";
+  const rapidApiTiktokKey = (env && env.RAPIDAPI_TIKTOK_KEY && String(env.RAPIDAPI_TIKTOK_KEY).trim()) || "";
+  const rapidApiIgKey = (env && env.RAPIDAPI_IG_KEY && String(env.RAPIDAPI_IG_KEY).trim()) || "";
+  const rapidApiTwitterKey = (env && env.RAPIDAPI_TWITTER_KEY && String(env.RAPIDAPI_TWITTER_KEY).trim()) || "";
+  const rapidApiFbKey = (env && env.RAPIDAPI_FB_KEY && String(env.RAPIDAPI_FB_KEY).trim()) || "";
+  const rapidApiRedditKey = (env && env.RAPIDAPI_REDDIT_KEY && String(env.RAPIDAPI_REDDIT_KEY).trim()) || "";
+  const rapidApiPinterestKey = (env && env.RAPIDAPI_PINTEREST_KEY && String(env.RAPIDAPI_PINTEREST_KEY).trim()) || "";
+
+  // RapidAPI hosts (optional overrides for self-hosted or alternative endpoints)
+  const rapidApiYoutubeHost = (env && env.RAPIDAPI_YOUTUBE_HOST && String(env.RAPIDAPI_YOUTUBE_HOST).trim()) || "";
+  const rapidApiTiktokHost = (env && env.RAPIDAPI_TIKTOK_HOST && String(env.RAPIDAPI_TIKTOK_HOST).trim()) || "";
+  const rapidApiIgHost = (env && env.RAPIDAPI_IG_HOST && String(env.RAPIDAPI_IG_HOST).trim()) || "";
+  const rapidApiTwitterHost = (env && env.RAPIDAPI_TWITTER_HOST && String(env.RAPIDAPI_TWITTER_HOST).trim()) || "";
+  const rapidApiFbHost = (env && env.RAPIDAPI_FB_HOST && String(env.RAPIDAPI_FB_HOST).trim()) || "";
+  const rapidApiRedditHost = (env && env.RAPIDAPI_REDDIT_HOST && String(env.RAPIDAPI_REDDIT_HOST).trim()) || "";
+  const rapidApiPinterestHost = (env && env.RAPIDAPI_PINTEREST_HOST && String(env.RAPIDAPI_PINTEREST_HOST).trim()) || "";
+
   return {
     botToken: token,
     ownerId: owner,
     webhookSecret: secret,
     webAppUrl,
     cobaltUrl,
+    rapidApiKey,
+    rapidApiYoutubeKey,
+    rapidApiTiktokKey,
+    rapidApiIgKey,
+    rapidApiTwitterKey,
+    rapidApiFbKey,
+    rapidApiRedditKey,
+    rapidApiPinterestKey,
+    rapidApiYoutubeHost,
+    rapidApiTiktokHost,
+    rapidApiIgHost,
+    rapidApiTwitterHost,
+    rapidApiFbHost,
+    rapidApiRedditHost,
+    rapidApiPinterestHost,
   };
 }
 
@@ -162,7 +309,7 @@ const worker = {
           ok: true,
           service: "telegram-rich-markdown-bot",
           version: "2.0",
-          features: ["rich-markdown", "admin-panel", "ai", "media-downloader", "polls", "analytics", "web-app", "inline"],
+          features: ["rich-markdown", "admin-panel", "ai", "media-downloader", "rapidapi", "polls", "analytics", "web-app", "inline"],
           time: Date.now(),
         });
       }
@@ -248,10 +395,15 @@ async function setupWebhook(cfg, url) {
   if (cfg.webhookSecret) body.secret_token = cfg.webhookSecret;
   const res = await tg(cfg, "setWebhook", body);
   const me  = await tg(cfg, "getMe", {});
+  
+  // Set bot commands for / menu
+  const cmdRes = await setupBotCommands(cfg);
+  
   return json({
     ok: res.ok,
     webhook_url: hookUrl,
     setWebhook: res,
+    setCommands: cmdRes,
     bot: me.ok ? me.result : null,
   });
 }
@@ -265,6 +417,176 @@ async function botInfo(cfg) {
   const me = await tg(cfg, "getMe", {});
   const wh = await tg(cfg, "getWebhookInfo", {});
   return json({ bot: me, webhook: wh });
+}
+
+/**
+ * Set bot commands for the / menu in Telegram.
+ * This shows users all available commands when they type /
+ */
+async function setupBotCommands(cfg) {
+  const commands = [
+    { command: "start", description: "🚀 شروع / Start" },
+    { command: "ai", description: "🤖 تولید محتوا با AI" },
+    { command: "askai", description: "💬 چت با AI" },
+    { command: "dl", description: "📥 دانلود مدیا" },
+    { command: "poll", description: "📊 ساخت نظرسنجی" },
+    { command: "quiz", description: "🎯 ساخت کوییز" },
+    { command: "stats", description: "📈 آمار کانال" },
+    { command: "schedule", description: "⏰ زمان‌بندی پست" },
+    { command: "webapp", description: "🌐 پنل وب" },
+    { command: "cancel", description: "❌ لغو عملیات" },
+  ];
+  return await tg(cfg, "setMyCommands", { commands });
+}
+
+// ─── Calendar Keyboard Generator ──────────────────────────────────────────────
+/**
+ * Generate a calendar keyboard for a given month.
+ * @param {number} year - Year (e.g. 2026)
+ * @param {number} month - Month (0-11)
+ * @param {string} lang - "fa" or "en"
+ * @returns {Object} Telegram inline keyboard
+ */
+function calendarKeyboard(year, month, lang) {
+  const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  
+  const dayNames = lang === "fa"
+    ? ["ش", "ی", "د", "س", "چ", "پ", "ج"]
+    : ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"];
+
+  const rows = [];
+  
+  rows.push([
+    { text: "⏪", callback_data: `${lang}_cal_yr_prev_${year}_${month}` },
+    { text: `${year}`, callback_data: `${lang}_noop` },
+    { text: "⏩", callback_data: `${lang}_cal_yr_next_${year}_${month}` },
+  ]);
+  
+  rows.push([
+    { text: "◀️", callback_data: `${lang}_cal_prev_${year}_${month}` },
+    { text: `${monthNames[month]}`, callback_data: `${lang}_noop` },
+    { text: "▶️", callback_data: `${lang}_cal_next_${year}_${month}` },
+  ]);
+  
+  rows.push(dayNames.map(d => ({ text: d, callback_data: `${lang}_noop` })));
+  
+  const firstDay = new Date(year, month, 1).getDay();
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+  
+  // Use Iran timezone (UTC+3:30) for "today" calculation
+  const nowUTC = Date.now();
+  const iranOffset = 3.5 * 60 * 60 * 1000;
+  const todayIR = new Date(nowUTC + iranOffset);
+  const todayYear = todayIR.getUTCFullYear();
+  const todayMonth = todayIR.getUTCMonth();
+  const todayDate = todayIR.getUTCDate();
+  
+  const startDay = firstDay === 0 ? 6 : firstDay - 1;
+  
+  let row = [];
+  
+  for (let i = 0; i < startDay; i++) {
+    row.push({ text: " ", callback_data: `${lang}_noop` });
+  }
+  
+  for (let day = 1; day <= daysInMonth; day++) {
+    const isToday = todayYear === year && todayMonth === month && todayDate === day;
+    const isPast = new Date(year, month, day) < new Date(todayYear, todayMonth, todayDate);
+    
+    let text;
+    if (isToday) text = `•${day}•`;
+    else if (isPast) text = `${day}̲`;
+    else text = `${day}`;
+    
+    if (isPast) {
+      row.push({ text, callback_data: `${lang}_noop` });
+    } else {
+      row.push({ text, callback_data: `${lang}_cal_day_${year}_${month}_${day}` });
+    }
+    
+    if (row.length === 7) {
+      rows.push(row);
+      row = [];
+    }
+  }
+  
+  while (row.length > 0 && row.length < 7) {
+    row.push({ text: " ", callback_data: `${lang}_noop` });
+  }
+  if (row.length > 0) rows.push(row);
+  
+  rows.push([{ text: lang === "fa" ? "❌ لغو" : "❌ Cancel", callback_data: `${lang}_cancel_flow` }]);
+  
+  return { inline_keyboard: rows };
+}
+
+/**
+ * Generate time picker keyboard.
+ * @param {string} lang - "fa" or "en"
+ * @returns {Object} Telegram inline keyboard
+ */
+function timePickerKeyboard(lang) {
+  const rows = [];
+  
+  // Common hours: morning, noon, afternoon, evening, night
+  if (lang === "fa") {
+    rows.push([
+      { text: "🌅 ۰۶:۰۰", callback_data: `${lang}_time_6_00` },
+      { text: "☀️ ۰۹:۰۰", callback_data: `${lang}_time_9_00` },
+      { text: "🌤 ۱۱:۰۰", callback_data: `${lang}_time_11_00` },
+    ]);
+    rows.push([
+      { text: "🍽 ۱۲:۰۰", callback_data: `${lang}_time_12_00` },
+      { text: "🌞 ۱۴:۰۰", callback_data: `${lang}_time_14_00` },
+      { text: "🌇 ۱۸:۰۰", callback_data: `${lang}_time_18_00` },
+    ]);
+    rows.push([
+      { text: "🌙 ۲۰:۰۰", callback_data: `${lang}_time_20_00` },
+      { text: "🌃 ۲۱:۰۰", callback_data: `${lang}_time_21_00` },
+      { text: "🛏 ۲۳:۰۰", callback_data: `${lang}_time_23_00` },
+    ]);
+    rows.push([{ text: "⏰ ساعت دیگر...", callback_data: `${lang}_time_custom` }]);
+    rows.push([
+      { text: "⏰ +۱ ساعت", callback_data: `${lang}_time_quick_1h` },
+      { text: "⏰ +۲ ساعت", callback_data: `${lang}_time_quick_2h` },
+      { text: "⏰ +۳ ساعت", callback_data: `${lang}_time_quick_3h` },
+    ]);
+    rows.push([
+      { text: "🌅 فردا ۹ صبح", callback_data: `${lang}_time_quick_tomorrow_9` },
+      { text: "🌙 فردا ۱۸ عصر", callback_data: `${lang}_time_quick_tomorrow_18` },
+    ]);
+  } else {
+    rows.push([
+      { text: "🌅 06:00", callback_data: `${lang}_time_6_00` },
+      { text: "☀️ 09:00", callback_data: `${lang}_time_9_00` },
+      { text: "🌤 11:00", callback_data: `${lang}_time_11_00` },
+    ]);
+    rows.push([
+      { text: "🍽 12:00", callback_data: `${lang}_time_12_00` },
+      { text: "🌞 14:00", callback_data: `${lang}_time_14_00` },
+      { text: "🌇 18:00", callback_data: `${lang}_time_18_00` },
+    ]);
+    rows.push([
+      { text: "🌙 20:00", callback_data: `${lang}_time_20_00` },
+      { text: "🌃 21:00", callback_data: `${lang}_time_21_00` },
+      { text: "🛏 23:00", callback_data: `${lang}_time_23_00` },
+    ]);
+    rows.push([{ text: "⏰ Other time...", callback_data: `${lang}_time_custom` }]);
+    rows.push([
+      { text: "⏰ +1 hour", callback_data: `${lang}_time_quick_1h` },
+      { text: "⏰ +2 hours", callback_data: `${lang}_time_quick_2h` },
+      { text: "⏰ +3 hours", callback_data: `${lang}_time_quick_3h` },
+    ]);
+    rows.push([
+      { text: "🌅 Tomorrow 9 AM", callback_data: `${lang}_time_quick_tomorrow_9` },
+      { text: "🌙 Tomorrow 6 PM", callback_data: `${lang}_time_quick_tomorrow_18` },
+    ]);
+  }
+  
+  rows.push([{ text: lang === "fa" ? "◀️ بازگشت به تقویم" : "◀️ Back to calendar", callback_data: `${lang}_time_back_cal` }]);
+  rows.push([{ text: lang === "fa" ? "❌ لغو" : "❌ Cancel", callback_data: `${lang}_cancel_flow` }]);
+  
+  return { inline_keyboard: rows };
 }
 
 async function getUpdates(cfg, url) {
@@ -282,10 +604,10 @@ async function getUpdates(cfg, url) {
 // ═══════════════════════════════════════════════════════════════════════════════
 async function getAdmins(env, cfg) {
   try {
-    const raw = await env.BOT_DB.get("admins");
-    let list = raw ? JSON.parse(raw) : [];
-    if (!list.includes(cfg.ownerId)) list = [cfg.ownerId, ...list];
-    return list;
+    const list = await cachedGet(env, "admins", "text", 120000); // 2min cache
+    const parsed = list ? JSON.parse(list) : [];
+    if (!parsed.includes(cfg.ownerId)) return [cfg.ownerId, ...parsed];
+    return parsed;
   } catch {
     return [cfg.ownerId];
   }
@@ -294,7 +616,7 @@ async function getAdmins(env, cfg) {
 async function setAdmins(env, list, cfg) {
   if (!list.includes(cfg.ownerId)) list = [cfg.ownerId, ...list];
   list = [...new Set(list)];
-  await env.BOT_DB.put("admins", JSON.stringify(list));
+  await cachedPut(env, "admins", list);
   return list;
 }
 
@@ -305,7 +627,7 @@ async function isAdmin(env, userId, cfg) {
 
 async function getChannels(env) {
   try {
-    const raw = await env.BOT_DB.get("channels");
+    const raw = await cachedGet(env, "channels", "text", 30000); // 30s cache
     return raw ? JSON.parse(raw) : [];
   } catch {
     return [];
@@ -313,7 +635,7 @@ async function getChannels(env) {
 }
 
 async function setChannels(env, list) {
-  await env.BOT_DB.put("channels", JSON.stringify(list));
+  await cachedPut(env, "channels", list);
   return list;
 }
 
@@ -335,12 +657,10 @@ async function setState(env, userId, state) {
 }
 
 // ─── AI config (KV key "ai_config") ──────────────────────────────────────────
-// Stored config overrides env vars. getAiConfig() merges KV (if present) over
-// env defaults so a worker redeploy doesn't wipe admin-set keys.
 async function getAiConfig(env) {
   let kvConfig = null;
   try {
-    const raw = await env.BOT_DB.get("ai_config");
+    const raw = await cachedGet(env, "ai_config", "text", 300000); // 5min cache
     if (raw) kvConfig = JSON.parse(raw);
   } catch {}
 
@@ -356,13 +676,13 @@ async function getAiConfig(env) {
 }
 
 async function setAiConfig(env, config) {
-  await env.BOT_DB.put("ai_config", JSON.stringify(config));
+  await cachedPut(env, "ai_config", config);
 }
 
 // ─── Scheduled AI posts (KV key "scheduled_posts") ───────────────────────────
 async function getScheduledPosts(env) {
   try {
-    const raw = await env.BOT_DB.get("scheduled_posts");
+    const raw = await cachedGet(env, "scheduled_posts", "text", 10000); // 10s cache
     return raw ? JSON.parse(raw) : [];
   } catch {
     return [];
@@ -370,7 +690,7 @@ async function getScheduledPosts(env) {
 }
 
 async function saveScheduledPosts(env, list) {
-  await env.BOT_DB.put("scheduled_posts", JSON.stringify(list));
+  await cachedPut(env, "scheduled_posts", list);
 }
 
 async function addScheduledPost(env, post) {
@@ -390,7 +710,7 @@ async function removeScheduledPost(env, id) {
 // ─── Polls (KV keys "polls" + "poll_answers:<pollId>") ───────────────────────
 async function getPolls(env) {
   try {
-    const raw = await env.BOT_DB.get("polls");
+    const raw = await cachedGet(env, "polls", "text", 30000); // 30s cache
     return raw ? JSON.parse(raw) : [];
   } catch {
     return [];
@@ -398,7 +718,7 @@ async function getPolls(env) {
 }
 
 async function savePolls(env, list) {
-  await env.BOT_DB.put("polls", JSON.stringify(list));
+  await cachedPut(env, "polls", list);
 }
 
 async function addPoll(env, poll) {
@@ -422,71 +742,57 @@ async function savePollAnswers(env, pollId, list) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  Keyboards
+//  Keyboards - Improved UI/UX
 // ═══════════════════════════════════════════════════════════════════════════════
 function mainKeyboard(lang, admin, cfg) {
-  const adminRow = admin
-    ? (lang === "fa"
-        ? [
-            { text: "📝 ساخت پست", callback_data: "fa_newpost" },
-            { text: "⚙️ پنل ادمین", callback_data: "fa_admin_panel" },
-          ]
-        : [
-            { text: "📝 New Post", callback_data: "en_newpost" },
-            { text: "⚙️ Admin Panel", callback_data: "en_admin_panel" },
-          ])
-    : null;
-
   if (lang === "fa") {
     const rows = [
       [
-        { text: "📖 راهنمای Markdown", callback_data: "fa_help_md"   },
-        { text: "🌐 راهنمای HTML",     callback_data: "fa_help_html" },
-      ],
-      [
         { text: "🤖 هوش مصنوعی", callback_data: "fa_ai_menu" },
-        { text: "🛠 ابزارها",     callback_data: "fa_tools_menu" },
+        { text: "📥 دانلود", callback_data: "fa_dl_help" },
       ],
       [
-        { text: "📊 نظرسنجی",  callback_data: "fa_poll_menu" },
-        { text: "📈 آمار کانال", callback_data: "fa_stats_menu" },
+        { text: "📊 نظرسنجی", callback_data: "fa_standalone_poll_start" },
+        { text: "📈 آمار", callback_data: "fa_stats_menu" },
       ],
-      [
-        { text: "🎨 دمو کامل",   callback_data: "fa_demo"  },
-        { text: "ℹ️ درباره بات", callback_data: "fa_about" },
-      ],
+      [{ text: "─────────────", callback_data: "noop" }],
     ];
-    if (cfg && cfg.webAppUrl) {
-      rows.push([{ text: "🌐 پنل وب", web_app: { url: cfg.webAppUrl } }]);
+    if (admin) {
+      rows.push([
+        { text: "📝 ساخت پست", callback_data: "fa_newpost" },
+        { text: "⚙️ پنل ادمین", callback_data: "fa_admin_panel" },
+      ]);
     }
-    rows.push([{ text: "🇬🇧 Switch to English", callback_data: "en_start" }]);
-    if (adminRow) rows.push(adminRow);
+    rows.push([
+      { text: "📖 راهنما", callback_data: "fa_help_md" },
+      { text: "🌐 پنل وب", web_app: { url: cfg?.webAppUrl || "https://example.com" } },
+    ]);
+    rows.push([{ text: "🇬🇧 English", callback_data: "en_start" }]);
     return { inline_keyboard: rows };
   }
 
   const rows = [
     [
-      { text: "📖 Markdown Guide", callback_data: "en_help_md"   },
-      { text: "🌐 HTML Guide",     callback_data: "en_help_html" },
-    ],
-    [
       { text: "🤖 AI", callback_data: "en_ai_menu" },
-      { text: "🛠 Tools", callback_data: "en_tools_menu" },
+      { text: "📥 Download", callback_data: "en_dl_help" },
     ],
     [
-      { text: "📊 Polls", callback_data: "en_poll_menu" },
-      { text: "📈 Analytics", callback_data: "en_stats_menu" },
+      { text: "📊 Poll", callback_data: "en_standalone_poll_start" },
+      { text: "📈 Stats", callback_data: "en_stats_menu" },
     ],
-    [
-      { text: "🎨 Full Demo", callback_data: "en_demo"  },
-      { text: "ℹ️ About",     callback_data: "en_about" },
-    ],
+    [{ text: "─────────────", callback_data: "noop" }],
   ];
-  if (cfg && cfg.webAppUrl) {
-    rows.push([{ text: "🌐 Web Panel", web_app: { url: cfg.webAppUrl } }]);
+  if (admin) {
+    rows.push([
+      { text: "📝 New Post", callback_data: "en_newpost" },
+      { text: "⚙️ Admin", callback_data: "en_admin_panel" },
+    ]);
   }
-  rows.push([{ text: "🇮🇷 تغییر به فارسی", callback_data: "fa_start" }]);
-  if (adminRow) rows.push(adminRow);
+  rows.push([
+    { text: "📖 Help", callback_data: "en_help_md" },
+    { text: "🌐 Web Panel", web_app: { url: cfg?.webAppUrl || "https://example.com" } },
+  ]);
+  rows.push([{ text: "🇮🇷 فارسی", callback_data: "fa_start" }]);
   return { inline_keyboard: rows };
 }
 
@@ -494,260 +800,308 @@ function mainKeyboard(lang, admin, cfg) {
 function aiMenuKeyboard(lang, cfg) {
   const aiConfigured = cfg && cfg._aiConfigured;
   if (lang === "fa") {
-    const rows = [
-      [{ text: aiConfigured ? "💬 چت با AI (/askai)" : "⚙️ تنظیم AI اول", callback_data: "fa_ai_help" }],
-      [{ text: "✨ تولید محتوا با AI", callback_data: "fa_ai_generate" }],
-      [{ text: "⏰ زمان‌بندی ارسال AI", callback_data: "fa_ai_schedule" }],
-      [{ text: "📋 لیست زمان‌بندی‌ها", callback_data: "fa_ai_scheduled_list" }],
-      [{ text: "⚙️ تنظیمات AI", callback_data: "fa_ai_config_menu" }],
-      [{ text: "⬅️ بازگشت به منو", callback_data: "fa_back" }],
-    ];
-    return { inline_keyboard: rows };
+    return {
+      inline_keyboard: [
+        [
+          { text: aiConfigured ? "💬 چت" : "⚙️ تنظیم", callback_data: "fa_ai_help" },
+          { text: "✨ تولید", callback_data: "fa_ai_generate" },
+        ],
+        [
+          { text: "⏰ زمان‌بندی", callback_data: "fa_ai_schedule" },
+          { text: "📋 لیست", callback_data: "fa_ai_scheduled_list" },
+        ],
+        [{ text: "⚙️ تنظیمات", callback_data: "fa_ai_config_menu" }],
+        [{ text: "⬅️ بازگشت", callback_data: "fa_back" }],
+      ],
+    };
   }
-  const rows = [
-    [{ text: aiConfigured ? "💬 Chat with AI (/askai)" : "⚙️ Set up AI first", callback_data: "en_ai_help" }],
-    [{ text: "✨ Generate Content", callback_data: "en_ai_generate" }],
-    [{ text: "⏰ Schedule AI Post", callback_data: "en_ai_schedule" }],
-    [{ text: "📋 Scheduled Posts", callback_data: "en_ai_scheduled_list" }],
-    [{ text: "⚙️ AI Settings", callback_data: "en_ai_config_menu" }],
-    [{ text: "⬅️ Back to Menu", callback_data: "en_back" }],
-  ];
-  return { inline_keyboard: rows };
+  return {
+    inline_keyboard: [
+      [
+        { text: aiConfigured ? "💬 Chat" : "⚙️ Setup", callback_data: "en_ai_help" },
+        { text: "✨ Generate", callback_data: "en_ai_generate" },
+      ],
+      [
+        { text: "⏰ Schedule", callback_data: "en_ai_schedule" },
+        { text: "📋 List", callback_data: "en_ai_scheduled_list" },
+      ],
+      [{ text: "⚙️ Settings", callback_data: "en_ai_config_menu" }],
+      [{ text: "⬅️ Back", callback_data: "en_back" }],
+    ],
+  };
 }
 
 // ─── Tools menu keyboard (download + misc) ────────────────────────────────────
 function toolsMenuKeyboard(lang) {
-  if (lang === "fa") return {
-    inline_keyboard: [
-      [{ text: "📥 دانلود مدیا (/dl)", callback_data: "fa_dl_help" }],
-      [{ text: "📖 راهنمای مدیا", callback_data: "fa_help_media" }],
-      [{ text: "⬅️ بازگشت به منو", callback_data: "fa_back" }],
-    ],
-  };
-  return {
-    inline_keyboard: [
-      [{ text: "📥 Download Media (/dl)", callback_data: "en_dl_help" }],
-      [{ text: "📖 Media Guide", callback_data: "en_help_media" }],
-      [{ text: "⬅️ Back to Menu", callback_data: "en_back" }],
-    ],
-  };
-}
-
-// ─── Poll menu keyboard ───────────────────────────────────────────────────────
-function pollMenuKeyboard(lang) {
-  if (lang === "fa") return {
-    inline_keyboard: [
-      [{ text: "📊 ساخت نظرسنجی", callback_data: "fa_poll_help" }],
-      [{ text: "🎯 ساخت کوییز", callback_data: "fa_poll_help" }],
-      [{ text: "📋 لیست نظرسنجی‌ها", callback_data: "fa_poll_list" }],
-      [{ text: "⬅️ بازگشت به منو", callback_data: "fa_back" }],
-    ],
-  };
-  return {
-    inline_keyboard: [
-      [{ text: "📊 Create Poll", callback_data: "en_poll_help" }],
-      [{ text: "🎯 Create Quiz", callback_data: "en_poll_help" }],
-      [{ text: "📋 List Polls", callback_data: "en_poll_list" }],
-      [{ text: "⬅️ Back to Menu", callback_data: "en_back" }],
-    ],
-  };
-}
-
-// ─── AI config menu keyboard (admin) ──────────────────────────────────────────
-function aiConfigMenuKeyboard(lang) {
-  if (lang === "fa") return {
-    inline_keyboard: [
-      [{ text: "🔑 تنظیم Provider + API Key", callback_data: "fa_ai_config_set" }],
-      [{ text: "🤖 تغییر مدل", callback_data: "fa_ai_model_set" }],
-      [{ text: "📝 تغییر System Prompt", callback_data: "fa_ai_system_set" }],
-      [{ text: "👁 نمایش تنظیمات", callback_data: "fa_ai_config_show" }],
-      [{ text: "⬅️ بازگشت", callback_data: "fa_ai_menu" }],
-    ],
-  };
-  return {
-    inline_keyboard: [
-      [{ text: "🔑 Set Provider + API Key", callback_data: "en_ai_config_set" }],
-      [{ text: "🤖 Change Model", callback_data: "en_ai_model_set" }],
-      [{ text: "📝 Change System Prompt", callback_data: "en_ai_system_set" }],
-      [{ text: "👁 Show Config", callback_data: "en_ai_config_show" }],
-      [{ text: "⬅️ Back", callback_data: "en_ai_menu" }],
-    ],
-  };
-}
-
-// ─── AI preview keyboard (after generation, before send/schedule) ─────────────
-function aiPreviewKeyboard(lang) {
-  if (lang === "fa") return {
-    inline_keyboard: [
-      [
-        { text: "📤 ارسال به کانال", callback_data: "fa_ai_send_now" },
-        { text: "⏰ زمان‌بندی", callback_data: "fa_ai_schedule_this" },
+  const key = `tools_${lang}`;
+  return cachedKeyboard(key, () => {
+    if (lang === "fa") return {
+      inline_keyboard: [
+        [{ text: "📥 دانلود مدیا", callback_data: "fa_dl_help" }],
+        [{ text: "⬅️ بازگشت", callback_data: "fa_back" }],
       ],
-      [
-        { text: "🔄 تولید مجدد", callback_data: "fa_ai_regenerate" },
-        { text: "✏️ ویرایش", callback_data: "fa_ai_edit" },
+    };
+    return {
+      inline_keyboard: [
+        [{ text: "📥 Media Download", callback_data: "en_dl_help" }],
+        [{ text: "⬅️ Back", callback_data: "en_back" }],
       ],
-      [{ text: "❌ لغو", callback_data: "fa_cancel" }],
-    ],
-  };
-  return {
-    inline_keyboard: [
-      [
-        { text: "📤 Send to Channel", callback_data: "en_ai_send_now" },
-        { text: "⏰ Schedule", callback_data: "en_ai_schedule_this" },
-      ],
-      [
-        { text: "🔄 Regenerate", callback_data: "en_ai_regenerate" },
-        { text: "✏️ Edit", callback_data: "en_ai_edit" },
-      ],
-      [{ text: "❌ Cancel", callback_data: "en_cancel" }],
-    ],
-  };
-}
-
-// ─── Channel select keyboard (reused for AI send + AI schedule) ───────────────
-// `mode` is either "ai_send" or "ai_schedule" — stored in callback_data prefix.
-function aiChannelSelectKeyboard(lang, channels, selected, mode) {
-  const rows = channels.map(ch => {
-    const checked = selected.includes(String(ch.id)) ? "✅ " : "▫️ ";
-    return [{ text: `${checked}${ch.title}`, callback_data: `${lang}_ai_${mode}_ch_${ch.id}` }];
+    };
   });
-  if (lang === "fa") {
-    rows.push([{ text: "✅ ادامه", callback_data: `fa_ai_${mode}_confirm` }]);
-    rows.push([{ text: "❌ لغو", callback_data: "fa_cancel" }]);
-  } else {
-    rows.push([{ text: "✅ Continue", callback_data: `en_ai_${mode}_confirm` }]);
-    rows.push([{ text: "❌ Cancel", callback_data: "en_cancel" }]);
-  }
-  return { inline_keyboard: rows };
 }
 
+// ─── Poll menu keyboard ──────────────────────────────────────────────────────
+function pollMenuKeyboard(lang) {
+  const key = `poll_${lang}`;
+  return cachedKeyboard(key, () => {
+    if (lang === "fa") return {
+      inline_keyboard: [
+        [{ text: "📊 ساخت نظرسنجی", callback_data: "fa_standalone_poll_start" }],
+        [{ text: "📊 نتایج", callback_data: "fa_pollstats" }],
+        [{ text: "⬅️ بازگشت", callback_data: "fa_back" }],
+      ],
+    };
+    return {
+      inline_keyboard: [
+        [{ text: "📊 Create Poll", callback_data: "en_standalone_poll_start" }],
+        [{ text: "📊 Results", callback_data: "en_pollstats" }],
+        [{ text: "⬅️ Back", callback_data: "en_back" }],
+      ],
+    };
+  });
+}
+
+// ─── AI Config menu keyboard ─────────────────────────────────────────────────
+function aiConfigMenuKeyboard(lang) {
+  const key = `aicfg_${lang}`;
+  return cachedKeyboard(key, () => {
+    if (lang === "fa") return {
+      inline_keyboard: [
+        [{ text: "🔑 تغییر Provider", callback_data: "fa_aiconfig_change" }],
+        [{ text: "🤖 تغییر مدل", callback_data: "fa_aimodel_change" }],
+        [{ text: "📝 تغییر System Prompt", callback_data: "fa_aisystem_change" }],
+        [{ text: "⬅️ بازگشت", callback_data: "fa_ai_menu" }],
+      ],
+    };
+    return {
+      inline_keyboard: [
+        [{ text: "🔑 Change Provider", callback_data: "en_aiconfig_change" }],
+        [{ text: "🤖 Change Model", callback_data: "en_aimodel_change" }],
+        [{ text: "📝 Change System Prompt", callback_data: "en_aisystem_change" }],
+        [{ text: "⬅️ Back", callback_data: "en_ai_menu" }],
+      ],
+    };
+  });
+}
+
+// ─── AI preview keyboard (after generation) ───────────────────────────────────
+function aiPreviewKeyboard(lang) {
+  const key = `aiprev_${lang}`;
+  return cachedKeyboard(key, () => {
+    if (lang === "fa") return {
+      inline_keyboard: [
+        [
+          { text: "📤 ارسال فوری", callback_data: "fa_ai_send_now" },
+          { text: "⏰ زمان‌بندی", callback_data: "fa_ai_schedule_now" },
+        ],
+        [
+          { text: "✏️ ویرایش", callback_data: "fa_ai_edit" },
+          { text: "🔄 بازسازی", callback_data: "fa_ai_regenerate" },
+        ],
+        [{ text: "❌ لغو", callback_data: "fa_ai_cancel" }],
+      ],
+    };
+    return {
+      inline_keyboard: [
+        [
+          { text: "📤 Send Now", callback_data: "en_ai_send_now" },
+          { text: "⏰ Schedule", callback_data: "en_ai_schedule_now" },
+        ],
+        [
+          { text: "✏️ Edit", callback_data: "en_ai_edit" },
+          { text: "🔄 Regenerate", callback_data: "en_ai_regenerate" },
+        ],
+        [{ text: "❌ Cancel", callback_data: "en_ai_cancel" }],
+      ],
+    };
+  });
+}
+
+// ─── Back keyboard ────────────────────────────────────────────────────────────
 function backKeyboard(lang) {
-  return {
-    inline_keyboard: [
-      [
-        lang === "fa"
-          ? { text: "⬅️ بازگشت به منو", callback_data: "fa_back" }
-          : { text: "⬅️ Back to Menu",  callback_data: "en_back" },
-        lang === "fa"
-          ? { text: "🇬🇧 English", callback_data: "en_start" }
-          : { text: "🇮🇷 فارسی",  callback_data: "fa_start" },
-      ],
-    ],
-  };
+  const key = `back_${lang}`;
+  return cachedKeyboard(key, () => ({
+    inline_keyboard: [[
+      { text: lang === "fa" ? "⬅️ بازگشت" : "⬅️ Back", callback_data: `${lang}_back` },
+    ]],
+  }));
 }
 
-// ─── Admin panel ──────────────────────────────────────────────────────────────
+// ─── Admin panel keyboard ─────────────────────────────────────────────────────
 function adminPanelKeyboard(lang) {
-  if (lang === "fa") return {
-    inline_keyboard: [
-      [
-        { text: "👤 مدیریت ادمین‌ها", callback_data: "fa_admins_menu" },
-        { text: "📡 مدیریت کانال‌ها", callback_data: "fa_channels_menu" },
+  const key = `admin_${lang}`;
+  return cachedKeyboard(key, () => {
+    if (lang === "fa") return {
+      inline_keyboard: [
+        [
+          { text: "👤 ادمین‌ها", callback_data: "fa_admins_menu" },
+          { text: "📡 کانال‌ها", callback_data: "fa_channels_menu" },
+        ],
+        [{ text: "🤖 هوش مصنوعی", callback_data: "fa_ai_menu" }],
+        [{ text: "⬅️ بازگشت", callback_data: "fa_back" }],
       ],
-      [{ text: "📝 ساخت پست", callback_data: "fa_newpost" }],
-      [{ text: "⬅️ بازگشت به منو", callback_data: "fa_back" }],
-    ],
-  };
-  return {
-    inline_keyboard: [
-      [
-        { text: "👤 Manage Admins", callback_data: "en_admins_menu" },
-        { text: "📡 Manage Channels", callback_data: "en_channels_menu" },
+    };
+    return {
+      inline_keyboard: [
+        [
+          { text: "👤 Admins", callback_data: "en_admins_menu" },
+          { text: "📡 Channels", callback_data: "en_channels_menu" },
+        ],
+        [{ text: "🤖 AI", callback_data: "en_ai_menu" }],
+        [{ text: "⬅️ Back", callback_data: "en_back" }],
       ],
-      [{ text: "📝 New Post", callback_data: "en_newpost" }],
-      [{ text: "⬅️ Back to Menu", callback_data: "en_back" }],
-    ],
-  };
+    };
+  });
 }
 
+// ─── Admins menu keyboard ─────────────────────────────────────────────────────
 function adminsMenuKeyboard(lang) {
-  if (lang === "fa") return {
-    inline_keyboard: [
-      [{ text: "➕ افزودن ادمین", callback_data: "fa_admin_add" }],
-      [{ text: "➖ حذف ادمین", callback_data: "fa_admin_remove" }],
-      [{ text: "📋 لیست ادمین‌ها", callback_data: "fa_admin_list" }],
-      [{ text: "⬅️ بازگشت", callback_data: "fa_admin_panel" }],
-    ],
-  };
-  return {
-    inline_keyboard: [
-      [{ text: "➕ Add Admin", callback_data: "en_admin_add" }],
-      [{ text: "➖ Remove Admin", callback_data: "en_admin_remove" }],
-      [{ text: "📋 List Admins", callback_data: "en_admin_list" }],
-      [{ text: "⬅️ Back", callback_data: "en_admin_panel" }],
-    ],
-  };
+  const key = `admins_${lang}`;
+  return cachedKeyboard(key, () => {
+    if (lang === "fa") return {
+      inline_keyboard: [
+        [{ text: "➕ افزودن ادمین", callback_data: "fa_add_admin" }],
+        [{ text: "🗑 حذف ادمین", callback_data: "fa_remove_admin" }],
+        [{ text: "📋 لیست ادمین‌ها", callback_data: "fa_list_admins" }],
+        [{ text: "⬅️ بازگشت", callback_data: "fa_admin_panel" }],
+      ],
+    };
+    return {
+      inline_keyboard: [
+        [{ text: "➕ Add Admin", callback_data: "en_add_admin" }],
+        [{ text: "🗑 Remove Admin", callback_data: "en_remove_admin" }],
+        [{ text: "📋 List Admins", callback_data: "en_list_admins" }],
+        [{ text: "⬅️ Back", callback_data: "en_admin_panel" }],
+      ],
+    };
+  });
 }
 
+// ─── Channels menu keyboard ───────────────────────────────────────────────────
 function channelsMenuKeyboard(lang) {
-  if (lang === "fa") return {
-    inline_keyboard: [
-      [{ text: "➕ افزودن کانال", callback_data: "fa_channel_add" }],
-      [{ text: "➖ حذف کانال", callback_data: "fa_channel_remove" }],
-      [{ text: "📋 لیست کانال‌ها", callback_data: "fa_channel_list" }],
-      [{ text: "⬅️ بازگشت", callback_data: "fa_admin_panel" }],
-    ],
-  };
-  return {
-    inline_keyboard: [
-      [{ text: "➕ Add Channel", callback_data: "en_channel_add" }],
-      [{ text: "➖ Remove Channel", callback_data: "en_channel_remove" }],
-      [{ text: "📋 List Channels", callback_data: "en_channel_list" }],
-      [{ text: "⬅️ Back", callback_data: "en_admin_panel" }],
-    ],
-  };
+  const key = `channels_${lang}`;
+  return cachedKeyboard(key, () => {
+    if (lang === "fa") return {
+      inline_keyboard: [
+        [{ text: "➕ افزودن کانال", callback_data: "fa_add_channel" }],
+        [{ text: "🗑 حذف کانال", callback_data: "fa_remove_channel" }],
+        [{ text: "📋 لیست کانال‌ها", callback_data: "fa_list_channels" }],
+        [{ text: "⬅️ بازگشت", callback_data: "fa_admin_panel" }],
+      ],
+    };
+    return {
+      inline_keyboard: [
+        [{ text: "➕ Add Channel", callback_data: "en_add_channel" }],
+        [{ text: "🗑 Remove Channel", callback_data: "en_remove_channel" }],
+        [{ text: "📋 List Channels", callback_data: "en_list_channels" }],
+        [{ text: "⬅️ Back", callback_data: "en_admin_panel" }],
+      ],
+    };
+  });
 }
 
+// ─── Cancel keyboard ──────────────────────────────────────────────────────────
 function cancelKeyboard(lang) {
-  if (lang === "fa") return { inline_keyboard: [[{ text: "❌ لغو", callback_data: "fa_cancel" }]] };
-  return { inline_keyboard: [[{ text: "❌ Cancel", callback_data: "en_cancel" }]] };
+  const key = `cancel_${lang}`;
+  return cachedKeyboard(key, () => ({
+    inline_keyboard: [[
+      { text: lang === "fa" ? "❌ لغو" : "❌ Cancel", callback_data: `${lang}_cancel_flow` },
+    ]],
+  }));
 }
 
-// آیا برای پست دکمه اضافه شود؟
+// ─── Ask buttons keyboard ─────────────────────────────────────────────────────
 function askButtonsKeyboard(lang) {
-  if (lang === "fa") return {
+  const key = `askbtn_${lang}`;
+  return cachedKeyboard(key, () => ({
     inline_keyboard: [
       [
-        { text: "✅ آره", callback_data: "fa_post_btn_yes" },
-        { text: "❌ نه",  callback_data: "fa_post_btn_no" },
+        { text: lang === "fa" ? "✅ آره" : "✅ Yes", callback_data: `${lang}_post_btn_yes` },
+        { text: lang === "fa" ? "❌ نه" : "❌ No", callback_data: `${lang}_post_btn_no` },
       ],
-      [{ text: "❌ لغو", callback_data: "fa_cancel" }],
     ],
-  };
-  return {
-    inline_keyboard: [
-      [
-        { text: "✅ Yes", callback_data: "en_post_btn_yes" },
-        { text: "❌ No",  callback_data: "en_post_btn_no" },
-      ],
-      [{ text: "❌ Cancel", callback_data: "en_cancel" }],
-    ],
-  };
+  }));
 }
 
-// پیش‌نمایش: تایید / ویرایش / لغو
+// ─── Ask poll keyboard ────────────────────────────────────────────────────────
+function askPollKeyboard(lang, hasPolls = false) {
+  const key = `askpoll_${lang}_${hasPolls}`;
+  return cachedKeyboard(key, () => {
+    if (lang === "fa") {
+      const rows = [
+        [
+          { text: "📊 نظرسنجی", callback_data: "fa_post_poll_regular" },
+          { text: "🎯 کوییز", callback_data: "fa_post_poll_quiz" },
+        ],
+      ];
+      if (hasPolls) {
+        rows.push([{ text: "✅ ادامه", callback_data: "fa_post_poll_done" }]);
+      }
+      rows.push([{ text: "❌ نه", callback_data: "fa_post_poll_no" }]);
+      return { inline_keyboard: rows };
+    }
+    const rows = [
+      [
+        { text: "📊 Poll", callback_data: "en_post_poll_regular" },
+        { text: "🎯 Quiz", callback_data: "en_post_poll_quiz" },
+      ],
+    ];
+    if (hasPolls) {
+      rows.push([{ text: "✅ Continue", callback_data: "en_post_poll_done" }]);
+    }
+    rows.push([{ text: "❌ No", callback_data: "en_post_poll_no" }]);
+    return { inline_keyboard: rows };
+  });
+}
+
+// ─── Post schedule keyboard ───────────────────────────────────────────────────
+function postScheduleKeyboard(lang) {
+  const key = `postsch_${lang}`;
+  return cachedKeyboard(key, () => ({
+    inline_keyboard: [
+      [
+        { text: lang === "fa" ? "📤 فوری" : "📤 Now", callback_data: `${lang}_post_send_now` },
+        { text: lang === "fa" ? "⏰ زمان‌بندی" : "⏰ Schedule", callback_data: `${lang}_post_schedule` },
+      ],
+    ],
+  }));
+}
+
+// ─── Preview keyboard (confirm/edit) ──────────────────────────────────────────
 function previewKeyboard(lang) {
-  if (lang === "fa") return {
-    inline_keyboard: [
-      [{ text: "✅ تایید و ادامه", callback_data: "fa_post_confirm" }],
-      [
-        { text: "✏️ ویرایش متن", callback_data: "fa_post_edit_text" },
-        { text: "✏️ ویرایش دکمه‌ها", callback_data: "fa_post_edit_btns" },
+  const key = `preview_${lang}`;
+  return cachedKeyboard(key, () => {
+    if (lang === "fa") return {
+      inline_keyboard: [
+        [{ text: "✅ تایید", callback_data: "fa_post_confirm" }],
+        [
+          { text: "✏️ متن", callback_data: "fa_post_edit_text" },
+          { text: "✏️ دکمه", callback_data: "fa_post_edit_btns" },
+        ],
+        [{ text: "❌ لغو", callback_data: "fa_cancel_flow" }],
       ],
-      [{ text: "❌ لغو", callback_data: "fa_cancel" }],
-    ],
-  };
-  return {
-    inline_keyboard: [
-      [{ text: "✅ Confirm & Continue", callback_data: "en_post_confirm" }],
-      [
-        { text: "✏️ Edit Text", callback_data: "en_post_edit_text" },
-        { text: "✏️ Edit Buttons", callback_data: "en_post_edit_btns" },
+    };
+    return {
+      inline_keyboard: [
+        [{ text: "✅ Confirm", callback_data: "en_post_confirm" }],
+        [
+          { text: "✏️ Text", callback_data: "en_post_edit_text" },
+          { text: "✏️ Buttons", callback_data: "en_post_edit_btns" },
+        ],
+        [{ text: "❌ Cancel", callback_data: "en_cancel_flow" }],
       ],
-      [{ text: "❌ Cancel", callback_data: "en_cancel" }],
-    ],
-  };
+    };
+  });
 }
 
 // Select channels to send (multiple selection)
@@ -757,11 +1111,38 @@ function channelSelectKeyboard(lang, channels, selected) {
     return [{ text: `${checked}${ch.title}`, callback_data: `${lang}_post_ch_${ch.id}` }];
   });
   if (lang === "fa") {
-    rows.push([{ text: "📤 ارسال به موارد انتخاب شده", callback_data: "fa_post_send" }]);
-    rows.push([{ text: "❌ لغو", callback_data: "fa_cancel" }]);
+    rows.push([
+      { text: "📤 ارسال", callback_data: "fa_post_send" },
+      { text: "⏰ زمان‌بندی", callback_data: "fa_post_schedule" },
+    ]);
+    rows.push([{ text: "⬅️ بازگشت", callback_data: "fa_post_confirm_back" }]);
   } else {
-    rows.push([{ text: "📤 Send to Selected", callback_data: "en_post_send" }]);
-    rows.push([{ text: "❌ Cancel", callback_data: "en_cancel" }]);
+    rows.push([
+      { text: "📤 Send", callback_data: "en_post_send" },
+      { text: "⏰ Schedule", callback_data: "en_post_schedule" },
+    ]);
+    rows.push([{ text: "⬅️ Back", callback_data: "en_post_confirm_back" }]);
+  }
+  return { inline_keyboard: rows };
+}
+
+function standalonePollChannelSelect(lang, channels, selected) {
+  const rows = channels.map(ch => {
+    const checked = selected.includes(String(ch.id)) ? "✅ " : "▫️ ";
+    return [{ text: `${checked}${ch.title}`, callback_data: `${lang}_standalone_poll_ch_${ch.id}` }];
+  });
+  if (lang === "fa") {
+    rows.push([
+      { text: "📤 ارسال", callback_data: "fa_standalone_poll_confirm" },
+      { text: "⏰ زمان‌بندی", callback_data: "fa_standalone_poll_schedule" },
+    ]);
+    rows.push([{ text: "⬅️ بازگشت", callback_data: "fa_standalone_poll_start" }]);
+  } else {
+    rows.push([
+      { text: "📤 Send", callback_data: "en_standalone_poll_confirm" },
+      { text: "⏰ Schedule", callback_data: "en_standalone_poll_schedule" },
+    ]);
+    rows.push([{ text: "⬅️ Back", callback_data: "en_standalone_poll_start" }]);
   }
   return { inline_keyboard: rows };
 }
@@ -853,7 +1234,19 @@ async function handleMessage(message, env, cfg) {
 
   // /scheduled — list pending scheduled posts
   if (cmd === "scheduled") {
-    await showScheduledList(env, cfg, chatId, userId);
+    await handleScheduledList(env, cfg, chatId, userId, null, langFa(cfg, userId) ? "fa" : "en");
+    return;
+  }
+
+  // /cancel <id> — cancel a scheduled post
+  if (cmd === "cancel") {
+    if (!argText) {
+      await sendPlain(cfg, chatId, langFa(cfg, userId)
+        ? "⚠️ فرمت: `/cancel <شناسه>`\n\nبرای مشاهده شناسه‌ها: /scheduled"
+        : "⚠️ Format: `/cancel <id>`\n\nTo see IDs: /scheduled");
+      return;
+    }
+    await handleCancelScheduled(env, cfg, chatId, userId, argText.trim(), langFa(cfg, userId) ? "fa" : "en");
     return;
   }
 
@@ -907,8 +1300,8 @@ async function handleMessage(message, env, cfg) {
   if (cmd === "dl" || cmd === "download") {
     if (!argText) {
       await sendPlain(cfg, chatId, langFa(cfg, userId)
-        ? "📥 دانلود مدیا\n\nنحوه استفاده:\n`/dl https://youtu.be/xxxxx`\n`/dl https://github.com/user/repo/raw/...`\n\nپشتیبانی از: YouTube, Spotify (metadata), TikTok, Instagram, Twitter/X, SoundCloud, GitHub و...\n\n⚠️ فایل‌های بزرگ‌تر از 45MB به صورت لینک ارسال می‌شوند."
-        : "📥 Media Downloader\n\nUsage:\n`/dl https://youtu.be/xxxxx`\n`/dl https://github.com/user/repo/raw/...`\n\nSupports: YouTube, Spotify (metadata), TikTok, Instagram, Twitter/X, SoundCloud, GitHub, and more.\n\n⚠️ Files larger than 45MB are sent as download links.");
+        ? "📥 دانلود مدیا\n\nنحوه استفاده:\n`/dl https://youtu.be/xxxxx`\n`/dl https://github.com/user/repo/raw/...`\n\nپشتیبانی از: YouTube, TikTok, Instagram, Twitter/X, Facebook, Reddit, Pinterest, GitHub و...\n\n⚡ RapidAPI: " + (cfg.rapidApiKey ? "فعال ✅" : "غیرفعال (با RAPIDAPI_KEY فعال کنید)") + "\n\n⚠️ فایل‌های بزرگ‌تر از 45MB به صورت لینک ارسال می‌شوند."
+        : "📥 Media Downloader\n\nUsage:\n`/dl https://youtu.be/xxxxx`\n`/dl https://github.com/user/repo/raw/...`\n\nSupports: YouTube, TikTok, Instagram, Twitter/X, Facebook, Reddit, Pinterest, GitHub, and more.\n\n⚡ RapidAPI: " + (cfg.rapidApiKey ? "Enabled ✅" : "Disabled (set RAPIDAPI_KEY to enable)") + "\n\n⚠️ Files larger than 45MB are sent as download links.");
       return;
     }
     await handleDownload(cfg, chatId, userId, argText);
@@ -1081,19 +1474,23 @@ async function handleStateInput(env, message, state, cfg) {
     let text = entitiesToMarkdown(rawText, message.entities).trim();
     if (!text) text = trimmed;
 
-    const isHtml = text.startsWith("<") || /<\/?\w/.test(text);
+    // Parse embedded quizzes/polls from text
+    const { cleanText, polls } = parseEmbeddedPolls(text);
+    const isHtml = cleanText.startsWith("<") || /<\/?\w/.test(cleanText);
+    
     const newState = {
       action: "post_await_buttons_choice",
       lang,
-      text,
+      text: cleanText,
+      polls: polls,
       isHtml,
       buttons: null,
     };
     await setState(env, userId, newState);
 
     // Show converted post (preview)
-    if (isHtml) await sendRichHtml(cfg, chatId, text);
-    else await sendRichMarkdown(cfg, chatId, text);
+    if (isHtml) await sendRichHtml(cfg, chatId, cleanText);
+    else await sendRichMarkdown(cfg, chatId, cleanText);
 
     await sendPlain(cfg, chatId,
       lang === "fa"
@@ -1109,14 +1506,207 @@ async function handleStateInput(env, message, state, cfg) {
     const parsed = parseButtonsInput(trimmed);
     if (!parsed || parsed.length === 0) {
       await sendPlain(cfg, chatId, lang === "fa"
-        ? "⚠️ فرمت دکمه‌ها نامعتبر است. لطفاً مطابق نمونه ارسال کنید یا /cancel بزنید.\n\nنمونه:\nButton💠 - https://link.com\n\nButton🩵 - http://a.ai | Button💙 - http://b.ai\n\nButton🟣 - http://d.ai | Button🟠 - http://c.ai | Button💚 - http://e.ai"
-        : "⚠️ Invalid button format. Please follow the example or /cancel.\n\nExample:\nButton💠 - https://link.com\n\nButton🩵 - http://a.ai | Button💙 - http://b.ai\n\nButton🟣 - http://d.ai | Button🟠 - http://c.ai | Button💚 - http://e.ai");
+        ? "⚠️ فرمت نامعتبر. نمونه:\n\`Button💠 - https://link.com\`\n\`Button🩵 - http://a.ai | Button💙 - http://b.ai\`"
+        : "⚠️ Invalid format. Example:\n\`Button💠 - https://link.com\`\n\`Button🩵 - http://a.ai | Button💙 - http://b.ai\`");
       return true;
     }
 
-    const newState = { ...state, action: "post_preview", buttons: parsed };
+    // Save buttons for reuse later
+    await cachedPut(env, `buttons_${userId}`, parsed);
+    
+    // After buttons, ask about poll
+    const newState = { ...state, action: "post_await_poll_choice", buttons: parsed, polls: state.polls || [] };
     await setState(env, userId, newState);
-    await sendPostPreview(env, cfg, chatId, newState);
+    
+    const existingPolls = state.polls || [];
+    let msg;
+    if (existingPolls.length > 0) {
+      msg = lang === "fa"
+        ? `✅ ${parsed.flat().length} دکمه ذخیره شد!\n\n📊 ${existingPolls.length} نظرسنجی از متن شناسایی شد.\n\nنظرسنجی دیگری اضافه کنید یا "✅ ادامه" بزنید.`
+        : `✅ ${parsed.flat().length} buttons saved!\n\n📊 ${existingPolls.length} poll(s) detected from text.\n\nAdd more or click "✅ Continue".`;
+    } else {
+      msg = lang === "fa"
+        ? `✅ ${parsed.flat().length} دکمه ذخیره شد!\n\nآیا نظرسنجی اضافه کنید؟`
+        : `✅ ${parsed.flat().length} buttons saved!\n\nAdd a poll?`;
+    }
+    
+    await sendPlain(cfg, chatId, msg, askPollKeyboard(lang, existingPolls.length > 0));
+    return true;
+  }
+
+  // ── Post: Poll choice (regular/quiz/none) ────────────────────────────
+  if (state.action === "post_await_poll_choice") {
+    // User sends text with poll data: "question | opt1 | opt2 | opt3"
+    const isQuiz = state.pollType === "quiz";
+    const parts = trimmed.split("|").map(s => s.trim()).filter(s => s.length > 0);
+
+    if (parts.length < 3) {
+      await sendPlain(cfg, chatId, lang === "fa"
+        ? "⚠️ فرمت نامعتبر. لطفاً به این صورت بفرستید:\n\nسوال | گزینه۱ | گزینه۲ | گزینه۳\n\nبرای کوییز، گزینه درست را با `!` مشخص کنید:\nسوال | گزینه۱ | !گزینه۲ درست | گزینه۳\n\nیا /cancel بزنید."
+        : "⚠️ Invalid format. Send as:\n\nQuestion | Option1 | Option2 | Option3\n\nFor quiz, mark correct answer with `!`:\nQuestion | Wrong | !Correct | Wrong\n\nOr /cancel.");
+      return true;
+    }
+
+    const question = parts[0];
+    let options = parts.slice(1);
+    let correctOptionId = -1;
+
+    if (isQuiz) {
+      options = options.map((opt, idx) => {
+        if (opt.startsWith("!")) {
+          correctOptionId = idx;
+          return opt.slice(1).trim();
+        }
+        return opt;
+      });
+      if (correctOptionId === -1) {
+        await sendPlain(cfg, chatId, lang === "fa"
+          ? "⚠️ برای کوییز، گزینه درست را با `!` شروع کنید:\nسوال | اشتباه | !درست | اشتباه"
+          : "⚠️ For quiz, mark correct answer with `!`:\nQuestion | Wrong | !Correct | Wrong");
+        return true;
+      }
+    }
+
+    if (options.length < 2 || options.length > 10) {
+      await sendPlain(cfg, chatId, lang === "fa"
+        ? "⚠️ نظرسنجی باید ۲ تا ۱۰ گزینه داشته باشد."
+        : "⚠️ Poll needs 2-10 options.");
+      return true;
+    }
+
+    const poll = { question, options, type: isQuiz ? "quiz" : "regular", correctOptionId: correctOptionId >= 0 ? correctOptionId : null };
+    const polls = [...(state.polls || []), poll];
+    const newState = { ...state, action: "post_await_poll_choice", polls, pollType: null };
+    await setState(env, userId, newState);
+    
+    const pollCount = polls.length;
+    await sendPlain(cfg, chatId,
+      lang === "fa"
+        ? `✅ نظرسنجی ${pollCount} ذخیره شد!\n\n📊 ${pollCount} نظرسنجی آماده ارسال\n\nآیا نظرسنجی دیگری اضافه کنید؟`
+        : `✅ Poll ${pollCount} saved!\n\n📊 ${pollCount} polls ready to send\n\nAdd another poll?`,
+      askPollKeyboard(lang, true));
+    return true;
+  }
+
+  // ── Standalone poll: awaiting poll text ────────────────────────────────
+  if (state.action === "standalone_poll_await") {
+    const parts = trimmed.split("|").map(s => s.trim()).filter(s => s.length > 0);
+    if (parts.length < 3) {
+      await sendPlain(cfg, chatId, lang === "fa"
+        ? "⚠️ فرمت نامعتبر. به این صورت بفرستید:\n\n`سوال | گزینه۱ | گزینه۲ | گزینه۳`\n\nیا /cancel"
+        : "⚠️ Invalid format. Send as:\n\n`Question | Option1 | Option2 | Option3`\n\nOr /cancel");
+      return true;
+    }
+    const question = parts[0];
+    const options = parts.slice(1);
+    if (options.length < 2 || options.length > 10) {
+      await sendPlain(cfg, chatId, lang === "fa"
+        ? "⚠️ نظرسنجی باید ۲ تا ۱۰ گزینه داشته باشد."
+        : "⚠️ Poll needs 2-10 options.");
+      return true;
+    }
+    const poll = { question, options, type: "regular", correctOptionId: null };
+    const channels = await getChannels(env);
+    if (channels.length === 0) {
+      await setState(env, userId, null);
+      await sendPlain(cfg, chatId, lang === "fa"
+        ? "⚠️ هیچ کانالی ثبت نشده. ابتدا از پنل ادمین کانال اضافه کنید."
+        : "⚠️ No channels registered. Add one from admin panel first.");
+      return true;
+    }
+    await setState(env, userId, { action: "standalone_poll_select", lang, poll, selected: [] });
+    await sendPlain(cfg, chatId,
+      lang === "fa"
+        ? `📊 **${question}**\n${options.map((o,i) => `  ${i+1}. ${o}`).join("\n")}\n\n📡 کانال‌ها را انتخاب کنید:`
+        : `📊 **${question}**\n${options.map((o,i) => `  ${i+1}. ${o}`).join("\n")}\n\n📡 Select channels:`,
+      standalonePollChannelSelect(lang, channels, []));
+    return true;
+  }
+
+  // ── Standalone poll: awaiting time input ───────────────────────────────
+  if (state.action === "standalone_poll_await_time") {
+    const sendAt = parseLocalTime(trimmed);
+    if (!sendAt || isNaN(sendAt)) {
+      await sendPlain(cfg, chatId, lang === "fa"
+        ? "⚠️ فرمت زمان نامعتبر.\n• `2024-12-25 14:30` (ساعت ایران)\n• `in 2h`\n• `in 30m`\n\nیا /cancel"
+        : "⚠️ Invalid time.\n• `2024-12-25 14:30` (your local time)\n• `in 2h`\n• `in 30m`\n\nOr /cancel");
+      return true;
+    }
+    if (sendAt < Date.now()) {
+      await sendPlain(cfg, chatId, lang === "fa" ? "⚠️ زمان در گذشته است." : "⚠️ Time is in the past.");
+      return true;
+    }
+    const post = {
+      id: `sp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      userId,
+      prompt: state.poll.question,
+      generatedText: "",
+      channelIds: state.selected,
+      sendAt,
+      createdAt: Date.now(),
+      sent: false,
+      sentAt: null,
+      sendResults: [],
+      postState: { text: "", poll: state.poll },
+    };
+    await addScheduledPost(env, post);
+    await setState(env, userId, null);
+    const dateStr = new Date(sendAt + TIMEZONE_OFFSET_MS).toISOString().replace("T", " ").slice(0, 16).replace("Z", "") + " (IR)";
+    await sendPlain(cfg, chatId, (lang === "fa"
+      ? `✅ نظرسنجی زمان‌بندی شد!\n📅 زمان: \`${dateStr}\`\n📡 کانال‌ها: ${state.selected.length}\n\n/list: /scheduled`
+      : `✅ Poll scheduled!\n📅 Time: \`${dateStr}\`\n📡 Channels: ${state.selected.length}\n\nList: /scheduled`),
+      mainKeyboard(lang, await isAdmin(env, userId, cfg), cfg));
+    return true;
+  }
+
+  // ── Post schedule: awaiting time input ──────────────────────────────────
+  if (state.action === "post_await_time" || state.action === "schedule_await_time_text") {
+    const sendAt = parseLocalTime(trimmed);
+    if (!sendAt || isNaN(sendAt)) {
+      await sendPlain(cfg, chatId, lang === "fa"
+        ? "⚠️ فرمت زمان نامعتبر.\n\nفرمت‌ها:\n• `14:30`\n• `2026-06-26 14:30`\n• `in 2h`\n• `in 30m`\n\nبرای لغو /cancel"
+        : "⚠️ Invalid time format.\n\nFormats:\n• `14:30`\n• `2026-06-26 14:30`\n• `in 2h`\n• `in 30m`\n\n/cancel to abort");
+      return true;
+    }
+
+    if (sendAt < Date.now()) {
+      await sendPlain(cfg, chatId, lang === "fa"
+        ? "⚠️ زمان در گذشته است. یک زمان آینده بفرستید یا /cancel"
+        : "⚠️ Time is in the past. Send a future time or /cancel");
+      return true;
+    }
+
+    const channels = await getChannels(env);
+    const selected = state.selected || [];
+
+    // Create scheduled post
+    const post = {
+      id: `sp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      userId,
+      prompt: state.text,
+      generatedText: state.text,
+      channelIds: selected,
+      sendAt,
+      createdAt: Date.now(),
+      sent: false,
+      sentAt: null,
+      sendResults: [],
+      postType: "post",
+      postState: {
+        text: state.text,
+        isHtml: state.isHtml,
+        buttons: state.buttons,
+        polls: state.polls || [],
+      },
+    };
+    await addScheduledPost(env, post);
+    await setState(env, userId, null);
+
+    const dateStr = new Date(sendAt + TIMEZONE_OFFSET_MS).toISOString().replace("T", " ").slice(0, 16).replace("Z", "") + " (IR)";
+    await sendPlain(cfg, chatId, (lang === "fa"
+      ? `✅ پست زمان‌بندی شد!\n\n📅 زمان ارسال: \`${dateStr}\`\n📡 کانال‌ها: ${selected.length}\n🆔 شناسه: \`${post.id}\`\n\nبرای مشاهده لیست: /scheduled`
+      : `✅ Post scheduled!\n\n📅 Send at: \`${dateStr}\`\n📡 Channels: ${selected.length}\n🆔 ID: \`${post.id}\`\n\nList: /scheduled`),
+      mainKeyboard(lang, await isAdmin(env, userId, cfg), cfg));
     return true;
   }
 
@@ -1199,28 +1789,11 @@ async function handleStateInput(env, message, state, cfg) {
 
   // ── AI schedule: awaiting time input ──────────────────────────────────────
   if (state.action === "ai_await_time") {
-    // Parse "YYYY-MM-DD HH:MM" in the user's local time. We treat the input
-    // as UTC for simplicity — the admin can adjust. Also accept relative
-    // formats like "in 2h" or "in 30m" for convenience.
-    let sendAt = null;
-    const relMatch = trimmed.match(/^in\s+(\d+)\s*(m|min|minutes?|h|hr|hours?|d|days?)$/i);
-    if (relMatch) {
-      const num = parseInt(relMatch[1], 10);
-      const unit = relMatch[2].toLowerCase();
-      const mult = unit.startsWith("m") ? 60000 : unit.startsWith("h") ? 3600000 : 86400000;
-      sendAt = Date.now() + num * mult;
-    } else {
-      // Try YYYY-MM-DD HH:MM
-      const m = trimmed.match(/^(\d{4})-(\d{2})-(\d{2})[\s T]+(\d{2}):(\d{2})/);
-      if (m) {
-        sendAt = new Date(`${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:00Z`).getTime();
-      }
-    }
-
+    const sendAt = parseLocalTime(trimmed);
     if (!sendAt || isNaN(sendAt)) {
       await sendPlain(cfg, chatId, lang === "fa"
-        ? "⚠️ فرمت زمان نامعتبر. استفاده:\n• `2024-12-25 14:30`\n• `in 2h`\n• `in 30m`\n• `in 1d`\n\nبرای لغو /cancel"
-        : "⚠️ Invalid time format. Use:\n• `2024-12-25 14:30`\n• `in 2h`\n• `in 30m`\n• `in 1d`\n\n/cancel to abort");
+        ? "⚠️ فرمت زمان نامعتبر.\n• `2024-12-25 14:30` (ساعت ایران)\n• `in 2h`\n• `in 30m`\n\nبرای لغو /cancel"
+        : "⚠️ Invalid time format. Use:\n• `2024-12-25 14:30` (your local time)\n• `in 2h`\n• `in 30m`\n\n/cancel to abort");
       return true;
     }
 
@@ -1247,7 +1820,7 @@ async function handleStateInput(env, message, state, cfg) {
     await addScheduledPost(env, post);
     await setState(env, userId, null);
 
-    const dateStr = new Date(sendAt).toISOString().replace("T", " ").slice(0, 16) + " UTC";
+    const dateStr = new Date(sendAt + TIMEZONE_OFFSET_MS).toISOString().replace("T", " ").slice(0, 16).replace("Z", "") + " (IR)";
     await sendPlain(cfg, chatId, (lang === "fa"
       ? `✅ زمان‌بندی ثبت شد!\n\n📅 زمان ارسال: \`${dateStr}\`\n📡 کانال‌ها: ${post.channelIds.length}\n🆔 شناسه: \`${post.id}\`\n\nبرای مشاهده لیست: /scheduled`
       : `✅ Scheduled!\n\n📅 Send at: \`${dateStr}\`\n📡 Channels: ${post.channelIds.length}\n🆔 ID: \`${post.id}\`\n\nList: /scheduled`),
@@ -1344,18 +1917,115 @@ function parseButtonsInput(text) {
   return rows;
 }
 
+/**
+ * Parse embedded quizzes/polls from post text.
+ * Lines with | separator are detected as polls/quizzes.
+ * Lines with ! before an option become quizzes.
+ * Skips Markdown table rows (lines starting/ending with |).
+ * Returns { cleanText, polls }.
+ */
+function parseEmbeddedPolls(text) {
+  const lines = text.split("\n");
+  const cleanLines = [];
+  const polls = [];
+
+  for (const line of lines) {
+    const trimmedLine = line.trim();
+    
+    // Skip empty lines
+    if (!trimmedLine) {
+      cleanLines.push(line);
+      continue;
+    }
+    
+    // Skip Markdown table rows (start or end with |)
+    if (trimmedLine.startsWith("|") || trimmedLine.endsWith("|")) {
+      cleanLines.push(line);
+      continue;
+    }
+    
+    // Skip Markdown table separator lines (like |---|---|)
+    if (/^\|[\s\-:|]+\|$/.test(trimmedLine)) {
+      cleanLines.push(line);
+      continue;
+    }
+    
+    // Check if line looks like a poll/quiz: has | separator and at least 3 parts
+    const parts = trimmedLine.split("|").map(s => s.trim()).filter(s => s.length > 0);
+    
+    if (parts.length >= 3) {
+      // Check if any option has ! prefix (quiz)
+      let hasCorrect = false;
+      const options = parts.slice(1).map(opt => {
+        if (opt.startsWith("!")) {
+          hasCorrect = true;
+          return opt.slice(1).trim();
+        }
+        return opt;
+      });
+
+      // If it looks like a poll/quiz (question | option1 | option2 ...)
+      // and has reasonable option count (2-10)
+      if (options.length >= 2 && options.length <= 10) {
+        let correctOptionId = -1;
+        if (hasCorrect) {
+          parts.slice(1).forEach((opt, idx) => {
+            if (opt.startsWith("!")) correctOptionId = idx;
+          });
+        }
+
+        polls.push({
+          question: parts[0],
+          options: options,
+          type: hasCorrect ? "quiz" : "regular",
+          correctOptionId: correctOptionId >= 0 ? correctOptionId : null,
+        });
+        continue; // Don't add to clean text
+      }
+    }
+    
+    cleanLines.push(line);
+  }
+
+  return {
+    cleanText: cleanLines.join("\n").trim(),
+    polls: polls,
+  };
+}
+
 // ─── Send a post preview with approve/edit/cancel buttons and options ────────
 async function sendPostPreview(env, cfg, chatId, state) {
   const lang = state.lang || "fa";
   const replyMarkup = state.buttons ? { inline_keyboard: state.buttons } : undefined;
+  const polls = state.polls || [];
 
-  if (state.isHtml) await sendRichHtml(cfg, chatId, state.text, replyMarkup);
-  else await sendRichMarkdown(cfg, chatId, state.text, replyMarkup);
+  // STEP 1: Show text post FIRST (with buttons)
+  if (state.text) {
+    if (state.isHtml) await sendRichHtml(cfg, chatId, state.text, replyMarkup);
+    else await sendRichMarkdown(cfg, chatId, state.text, replyMarkup);
+  }
+
+  // STEP 2: Show all polls preview SEPARATELY
+  for (let i = 0; i < polls.length; i++) {
+    const poll = polls[i];
+    const pollType = poll.type === "quiz" ? (lang === "fa" ? "🎯 کوییز" : "🎯 Quiz") : (lang === "fa" ? "📊 نظرسنجی" : "📊 Poll");
+    const optionsText = poll.options.map((opt, idx) => {
+      const correct = poll.type === "quiz" && poll.correctOptionId === idx ? " ✅" : "";
+      return `  ${idx + 1}. ${opt}${correct}`;
+    }).join("\n");
+    await sendPlain(cfg, chatId, `${pollType} ${i + 1}: **${poll.question}**\n\n${optionsText}`);
+  }
+
+  // Show summary and confirm button
+  const summary = [];
+  if (state.text) summary.push(lang === "fa" ? "📝 متن" : "📝 Text");
+  if (state.buttons) summary.push(lang === "fa" ? "🔘 دکمه‌ها" : "🔘 Buttons");
+  if (polls.length > 0) summary.push(`${lang === "fa" ? "📊 نظرسنجی" : "📊 Poll"} ×${polls.length}`);
 
   await sendPlain(cfg, chatId,
-    lang === "fa"
-      ? "👆 این پیش‌نمایش پست شماست. در صورت تایید، در مرحله بعد کانال‌های ارسال را انتخاب کنید."
-      : "👆 This is your post preview. If confirmed, you'll choose channels to send to next.",
+    (lang === "fa"
+      ? "👆 پیش‌نمایش پست شما (" + summary.join(" + ") + ")\n\nتایید کنید تا کانال‌ها را انتخاب کنید."
+      : "👆 Post preview (" + summary.join(" + ") + ")\n\nConfirm to select channels."),
     previewKeyboard(lang)
   );
 }
@@ -1470,6 +2140,298 @@ async function handleCallback(cb, env, cfg) {
     await setState(env, userId, null);
     const txt = lang === "fa" ? "❌ عملیات لغو شد." : "❌ Operation cancelled.";
     await editRichMarkdown(cfg, chatId, msgId, txt, main);
+    return;
+  } else if (action === "cancel_flow") {
+    await setState(env, userId, null);
+    const txt = lang === "fa" ? "❌ عملیات لغو شد." : "❌ Operation cancelled.";
+    await sendPlain(cfg, chatId, txt, main);
+    return;
+  } else if (action === "noop") {
+    return; // Do nothing (divider button)
+  }
+
+  // ── Calendar handlers ─────────────────────────────────────────────────
+  if (action.startsWith("cal_yr_prev_") || action.startsWith("cal_yr_next_")) {
+    const parts = action.split("_");
+    const year = parseInt(parts[3]) + (action.startsWith("cal_yr_prev_") ? -1 : 1);
+    const month = parseInt(parts[4]);
+    await editKeyboardOnly(cfg, chatId, msgId, calendarKeyboard(year, month, lang));
+    return;
+  }
+
+  if (action.startsWith("cal_prev_") || action.startsWith("cal_next_")) {
+    const parts = action.split("_");
+    const year = parseInt(parts[2]);
+    const month = parseInt(parts[3]) + (action.startsWith("cal_prev_") ? -1 : 1);
+    const adjustedDate = new Date(year, month, 1);
+    await editKeyboardOnly(cfg, chatId, msgId, calendarKeyboard(adjustedDate.getFullYear(), adjustedDate.getMonth(), lang));
+    return;
+  }
+
+  if (action.startsWith("cal_day_")) {
+    const parts = action.split("_");
+    const year = parseInt(parts[2]);
+    const month = parseInt(parts[3]);
+    const day = parseInt(parts[4]);
+    const selectedDate = new Date(year, month, day);
+    
+    const state = await getState(env, userId);
+    if (!state) return;
+    
+    // Store selected date and show time picker
+    await setState(env, userId, { ...state, action: "schedule_pick_time", selectedDate: selectedDate.toISOString() });
+    
+    const dateStr = selectedDate.toLocaleDateString(lang === "fa" ? "fa-IR" : "en-US", { weekday: "long", year: "numeric", month: "long", day: "numeric" });
+    await editRichMarkdown(cfg, chatId, msgId,
+      lang === "fa"
+        ? `📅 **${dateStr}** انتخاب شد!\n\n⏰ ساعت را انتخاب کنید:`
+        : `📅 **${dateStr}** selected!\n\n⏰ Pick a time:`,
+      timePickerKeyboard(lang));
+    return;
+  }
+
+  // ── Time picker handlers ──────────────────────────────────────────────
+  if (action === "time_back_cal") {
+    const state = await getState(env, userId);
+    if (!state) return;
+    const now = new Date();
+    await editRichMarkdown(cfg, chatId, msgId,
+      lang === "fa" ? "📅 **تاریخ ارسال را انتخاب کنید:**" : "📅 **Pick a send date:**",
+      calendarKeyboard(now.getFullYear(), now.getMonth(), lang));
+    return;
+  }
+
+  if (action === "time_custom") {
+    const state = await getState(env, userId);
+    if (!state) return;
+    await setState(env, userId, { ...state, action: "schedule_await_time_text" });
+    await editRichMarkdown(cfg, chatId, msgId,
+      lang === "fa"
+        ? "⌨️ **ساعت را تایپ کنید:**\n\nفرمت: `14:30` یا `in 2h`"
+        : "⌨️ **Type the time:**\n\nFormat: `14:30` or `in 2h`",
+      cancelKeyboard(lang));
+    return;
+  }
+
+  if (action.startsWith("time_quick_")) {
+    const state = await getState(env, userId);
+    if (!state) return;
+    
+    let sendAt;
+    const now = Date.now();
+    
+    if (action === "time_quick_1h") sendAt = now + 3600000;
+    else if (action === "time_quick_2h") sendAt = now + 7200000;
+    else if (action === "time_quick_3h") sendAt = now + 10800000;
+    else if (action === "time_quick_6h") sendAt = now + 21600000;
+    else if (action === "time_quick_tomorrow_9") {
+      const tomorrow = new Date();
+      tomorrow.setDate(tomorrow.getDate() + 1);
+      tomorrow.setHours(9, 0, 0, 0);
+      sendAt = tomorrow.getTime();
+    }
+    else if (action === "time_quick_tomorrow_18") {
+      const tomorrow = new Date();
+      tomorrow.setDate(tomorrow.getDate() + 1);
+      tomorrow.setHours(18, 0, 0, 0);
+      sendAt = tomorrow.getTime();
+    }
+    
+    if (sendAt && state.selectedChannels) {
+      const post = {
+        id: `post_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        userId,
+        generatedText: state.text,
+        channelIds: state.selectedChannels,
+        sendAt,
+        sent: false,
+        postState: {
+          text: state.text,
+          isHtml: state.isHtml,
+          buttons: state.buttons,
+          polls: state.polls,
+        },
+      };
+      await addScheduledPost(env, post);
+      await setState(env, userId, null);
+      
+      const dateStr = new Date(sendAt).toLocaleString(lang === "fa" ? "fa-IR" : "en-US");
+      await editRichMarkdown(cfg, chatId, msgId,
+        lang === "fa"
+          ? `✅ **زمان‌بندی شد!**\n\n📅 زمان ارسال: \`${dateStr}\`\n📡 کانال‌ها: ${state.selectedChannels.length}\n🆔 شناسه: \`${post.id}\``
+          : `✅ **Scheduled!**\n\n📅 Send at: \`${dateStr}\`\n📡 Channels: ${state.selectedChannels.length}\n🆔 ID: \`${post.id}\``,
+        main);
+    }
+    return;
+  }
+
+  if (action.startsWith("time_")) {
+    const state = await getState(env, userId);
+    if (!state) return;
+    
+    const parts = action.split("_");
+    const hour = parseInt(parts[1]);
+    const minute = parseInt(parts[2] || 0);
+    
+    let sendAt;
+    if (state.selectedDate) {
+      const date = new Date(state.selectedDate);
+      date.setHours(hour, minute, 0, 0);
+      sendAt = date.getTime();
+    } else {
+      const now = new Date();
+      now.setHours(hour, minute, 0, 0);
+      sendAt = now.getTime();
+      if (sendAt < Date.now()) sendAt += 86400000;
+    }
+    
+    if (state.selectedChannels) {
+      const post = {
+        id: `post_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        userId,
+        generatedText: state.text,
+        channelIds: state.selectedChannels,
+        sendAt,
+        sent: false,
+        postState: {
+          text: state.text,
+          isHtml: state.isHtml,
+          buttons: state.buttons,
+          polls: state.polls,
+        },
+      };
+      await addScheduledPost(env, post);
+      await setState(env, userId, null);
+      
+      const dateStr = new Date(sendAt).toLocaleString(lang === "fa" ? "fa-IR" : "en-US");
+      await editRichMarkdown(cfg, chatId, msgId,
+        lang === "fa"
+          ? `✅ **زمان‌بندی شد!**\n\n📅 زمان ارسال: \`${dateStr}\`\n📡 کانال‌ها: ${state.selectedChannels.length}\n🆔 شناسه: \`${post.id}\``
+          : `✅ **Scheduled!**\n\n📅 Send at: \`${dateStr}\`\n📡 Channels: ${state.selectedChannels.length}\n🆔 ID: \`${post.id}\``,
+        main);
+    }
+    return;
+  }
+
+  if (action.startsWith("cal_day_")) {
+    const parts = action.split("_");
+    const year = parseInt(parts[2]);
+    const month = parseInt(parts[3]);
+    const day = parseInt(parts[4]);
+    const selectedDate = new Date(year, month, day);
+    
+    const state = await getState(env, userId);
+    if (!state) return;
+    
+    // Store selected date and show time picker
+    await setState(env, userId, { ...state, action: "schedule_await_time", selectedDate: selectedDate.toISOString() });
+    
+    const dateStr = selectedDate.toLocaleDateString(lang === "fa" ? "fa-IR" : "en-US", { weekday: "long", year: "numeric", month: "long", day: "numeric" });
+    await editRichMarkdown(cfg, chatId, msgId,
+      lang === "fa"
+        ? `📅 **${dateStr}** انتخاب شد!\n\n⏰ ساعت را انتخاب کنید:`
+        : `📅 **${dateStr}** selected!\n\n⏰ Pick a time:`,
+      timePickerKeyboard(lang));
+    return;
+  }
+
+  // ── Time picker handlers ──────────────────────────────────────────────
+  if (action.startsWith("time_quick_")) {
+    const state = await getState(env, userId);
+    if (!state) return;
+    
+    let sendAt;
+    const now = Date.now();
+    
+    if (action === "time_quick_1h") sendAt = now + 3600000;
+    else if (action === "time_quick_2h") sendAt = now + 7200000;
+    else if (action === "time_quick_3h") sendAt = now + 10800000;
+    else if (action === "time_quick_6h") sendAt = now + 21600000;
+    else if (action === "time_quick_tomorrow_9") {
+      const tomorrow = new Date();
+      tomorrow.setDate(tomorrow.getDate() + 1);
+      tomorrow.setHours(9, 0, 0, 0);
+      sendAt = tomorrow.getTime();
+    }
+    else if (action === "time_quick_tomorrow_21") {
+      const tomorrow = new Date();
+      tomorrow.setDate(tomorrow.getDate() + 1);
+      tomorrow.setHours(21, 0, 0, 0);
+      sendAt = tomorrow.getTime();
+    }
+    
+    if (sendAt && state.selectedChannels) {
+      // Schedule the post
+      const post = {
+        id: `post_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        userId,
+        generatedText: state.text,
+        channelIds: state.selectedChannels,
+        sendAt,
+        sent: false,
+        postState: {
+          text: state.text,
+          buttons: state.buttons,
+          polls: state.polls,
+        },
+      };
+      await addScheduledPost(env, post);
+      await setState(env, userId, null);
+      
+      const dateStr = new Date(sendAt).toLocaleString(lang === "fa" ? "fa-IR" : "en-US");
+      await editRichMarkdown(cfg, chatId, msgId,
+        lang === "fa"
+          ? `✅ **زمان‌بندی شد!**\n\n📅 زمان ارسال: \`${dateStr}\`\n📡 کانال‌ها: ${state.selectedChannels.length}\n🆔 شناسه: \`${post.id}\``
+          : `✅ **Scheduled!**\n\n📅 Send at: \`${dateStr}\`\n📡 Channels: ${state.selectedChannels.length}\n🆔 ID: \`${post.id}\``,
+        mainKeyboard(lang, admin, cfgWithAi));
+    }
+    return;
+  }
+
+  if (action.startsWith("time_")) {
+    const state = await getState(env, userId);
+    if (!state) return;
+    
+    const parts = action.split("_");
+    const hour = parseInt(parts[1]);
+    const minute = parseInt(parts[2] || 0);
+    
+    let sendAt;
+    if (state.selectedDate) {
+      const date = new Date(state.selectedDate);
+      date.setHours(hour, minute, 0, 0);
+      sendAt = date.getTime();
+    } else {
+      const now = new Date();
+      now.setHours(hour, minute, 0, 0);
+      sendAt = now.getTime();
+      if (sendAt < Date.now()) sendAt += 86400000; // Tomorrow if time passed
+    }
+    
+    if (state.selectedChannels) {
+      const post = {
+        id: `post_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        userId,
+        generatedText: state.text,
+        channelIds: state.selectedChannels,
+        sendAt,
+        sent: false,
+        postState: {
+          text: state.text,
+          buttons: state.buttons,
+          polls: state.polls,
+        },
+      };
+      await addScheduledPost(env, post);
+      await setState(env, userId, null);
+      
+      const dateStr = new Date(sendAt).toLocaleString(lang === "fa" ? "fa-IR" : "en-US");
+      await editRichMarkdown(cfg, chatId, msgId,
+        lang === "fa"
+          ? `✅ **زمان‌بندی شد!**\n\n📅 زمان ارسال: \`${dateStr}\`\n📡 کانال‌ها: ${state.selectedChannels.length}\n🆔 شناسه: \`${post.id}\``
+          : `✅ **Scheduled!**\n\n📅 Send at: \`${dateStr}\`\n📡 Channels: ${state.selectedChannels.length}\n🆔 ID: \`${post.id}\``,
+        mainKeyboard(lang, admin, cfgWithAi));
+    }
     return;
   }
 
@@ -1642,8 +2604,8 @@ async function handleCallback(cb, env, cfg) {
         selectedChannels: selected,
       });
       await sendPlain(cfg, chatId, lang === "fa"
-        ? "⏰ زمان ارسال را بفرستید:\n• `2024-12-25 14:30` (UTC)\n• `in 2h`\n• `in 30m`\n• `in 1d`\n\nبرای لغو /cancel"
-        : "⏰ Send the time:\n• `2024-12-25 14:30` (UTC)\n• `in 2h`\n• `in 30m`\n• `in 1d`\n\n/cancel to abort",
+        ? "⏰ زمان ارسال را بفرستید:\n• `2024-12-25 14:30` (ساعت ایران)\n• `in 2h`\n• `in 30m`\n\nبرای لغو /cancel"
+        : "⏰ Send the time:\n• `2024-12-25 14:30` (your local time)\n• `in 2h`\n• `in 30m`\n\n/cancel to abort",
         cancelKeyboard(lang));
       return;
     }
@@ -1737,7 +2699,8 @@ async function handleCallback(cb, env, cfg) {
     return;
   }
 
-  if (action === "admin_add") {
+  // Handle both "add_admin" and "admin_add" for compatibility
+  if (action === "add_admin" || action === "admin_add") {
     await setState(env, userId, { action: "admin_add", lang });
     const txt = lang === "fa"
       ? "➕ **افزودن ادمین**\n\nآیدی عددی تلگرام کاربر مورد نظر را ارسال کنید.\nبرای گرفتن آیدی عددی می‌توانید از بات‌هایی مثل @userinfobot استفاده کنید.\n\nبرای لغو /cancel را ارسال کنید."
@@ -1746,7 +2709,8 @@ async function handleCallback(cb, env, cfg) {
     return;
   }
 
-  if (action === "admin_remove") {
+  // Handle both "remove_admin" and "admin_remove" for compatibility
+  if (action === "remove_admin" || action === "admin_remove") {
     await setState(env, userId, { action: "admin_remove", lang });
     const admins = await getAdmins(env, cfg);
     const txt = (lang === "fa"
@@ -1756,7 +2720,8 @@ async function handleCallback(cb, env, cfg) {
     return;
   }
 
-  if (action === "admin_list") {
+  // Handle both "list_admins" and "admin_list" for compatibility
+  if (action === "list_admins" || action === "admin_list") {
     const admins = await getAdmins(env, cfg);
     const txt = (lang === "fa"
       ? `📋 **لیست ادمین‌ها** (${admins.length})\n\n`
@@ -1776,7 +2741,8 @@ async function handleCallback(cb, env, cfg) {
     return;
   }
 
-  if (action === "channel_add") {
+  // Handle both "add_channel" and "channel_add" for compatibility
+  if (action === "add_channel" || action === "channel_add") {
     await setState(env, userId, { action: "channel_add", lang });
     const txt = lang === "fa"
       ? "➕ **افزودن کانال**\n\n1. ربات را به کانال مورد نظر اضافه کنید.\n2. ربات را **ادمین کانال** کنید (با دسترسی ارسال پیام).\n3. آیدی عددی کانال (مثل `-1001234567890`) یا یوزرنیم آن (مثل `@mychannel`) را اینجا ارسال کنید.\n\nبرای لغو /cancel را ارسال کنید."
@@ -1785,7 +2751,8 @@ async function handleCallback(cb, env, cfg) {
     return;
   }
 
-  if (action === "channel_remove") {
+  // Handle both "remove_channel" and "channel_remove" for compatibility
+  if (action === "remove_channel" || action === "channel_remove") {
     const channels = await getChannels(env);
     if (channels.length === 0) {
       const txt = lang === "fa" ? "ℹ️ هیچ کانالی ثبت نشده است." : "ℹ️ No channels registered.";
@@ -1802,13 +2769,99 @@ async function handleCallback(cb, env, cfg) {
     return;
   }
 
-  if (action === "channel_list") {
+  // Handle both "list_channels" and "channel_list" for compatibility
+  if (action === "list_channels" || action === "channel_list") {
     const channels = await getChannels(env);
     const txt = channels.length === 0
       ? (lang === "fa" ? "ℹ️ هیچ کانالی ثبت نشده است." : "ℹ️ No channels registered.")
       : (lang === "fa" ? `📋 **لیست کانال‌ها** (${channels.length})\n\n` : `📋 **Channel List** (${channels.length})\n\n`) +
         channels.map(c => `• **${c.title}** — \`${c.id}\``).join("\n");
     await editRichMarkdown(cfg, chatId, msgId, txt, channelsMenuKeyboard(lang));
+    return;
+  }
+
+  // ── Standalone poll channel selection ─────────────────────────────────
+  if (action.startsWith("standalone_poll_ch_")) {
+    const chId = action.slice("standalone_poll_ch_".length);
+    const state = await getState(env, userId);
+    if (!state || state.action !== "standalone_poll_select") return;
+    let selected = state.selected || [];
+    if (selected.includes(chId)) selected = selected.filter(c => c !== chId);
+    else selected = [...selected, chId];
+    await setState(env, userId, { ...state, selected });
+    const channels = await getChannels(env);
+    await editKeyboardOnly(cfg, chatId, msgId, standalonePollChannelSelect(lang, channels, selected));
+    return;
+  }
+
+  if (action === "standalone_poll_confirm") {
+    const state = await getState(env, userId);
+    if (!state || state.action !== "standalone_poll_select") return;
+    const selected = state.selected || [];
+    if (selected.length === 0) {
+      await tg(cfg, "answerCallbackQuery", {
+        callback_query_id: cb.id,
+        text: lang === "fa" ? "⚠️ حداقل یک کانال" : "⚠️ Select at least one",
+        show_alert: true,
+      });
+      return;
+    }
+    // Send poll immediately to selected channels
+    const channels = await getChannels(env);
+    const results = [];
+    for (const chId of selected) {
+      const ch = channels.find(c => String(c.id) === String(chId));
+      if (!ch) continue;
+      const pollBody = {
+        chat_id: ch.id,
+        question: state.poll.question,
+        options: state.poll.options,
+        is_anonymous: true,
+      };
+      const res = await tg(cfg, "sendPoll", pollBody);
+      results.push({ title: ch.title, ok: res?.ok });
+      if (res?.ok) {
+        const pollRecord = {
+          id: `poll_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          pollId: res.result.poll.id,
+          question: state.poll.question,
+          options: state.poll.options,
+          chatId: ch.id,
+          messageId: res.result.message_id,
+          type: "regular",
+          createdAt: Date.now(),
+        };
+        await addPoll(env, pollRecord);
+      }
+    }
+    await setState(env, userId, null);
+    const lines = results.map(r => r.ok
+      ? (lang === "fa" ? `✅ **${r.title}**` : `✅ **${r.title}**`)
+      : (lang === "fa" ? `❌ **${r.title}**` : `❌ **${r.title}**`));
+    await sendRichMarkdown(cfg, chatId,
+      (lang === "fa" ? "📤 **نتیجه:**\n\n" : "📤 **Result:**\n\n") + lines.join("\n"),
+      mainKeyboard(lang, await isAdmin(env, userId, cfg), cfg));
+    return;
+  }
+
+  if (action === "standalone_poll_schedule") {
+    const state = await getState(env, userId);
+    if (!state || state.action !== "standalone_poll_select") return;
+    const selected = state.selected || [];
+    if (selected.length === 0) {
+      await tg(cfg, "answerCallbackQuery", {
+        callback_query_id: cb.id,
+        text: lang === "fa" ? "⚠️ حداقل یک کانال" : "⚠️ Select at least one",
+        show_alert: true,
+      });
+      return;
+    }
+    await setState(env, userId, { ...state, action: "standalone_poll_await_time" });
+    await editRichMarkdown(cfg, chatId, msgId,
+      lang === "fa"
+        ? "⏰ زمان ارسال:\n• `2024-12-25 14:30` (ساعت ایران)\n• `in 2h`\n• `in 30m`\n\nیا /cancel"
+        : "⏰ Schedule time:\n• `2024-12-25 14:30` (your local time)\n• `in 2h`\n• `in 30m`\n\nOr /cancel",
+      cancelKeyboard(lang));
     return;
   }
 
@@ -1825,20 +2878,141 @@ async function handleCallback(cb, env, cfg) {
   if (action === "post_btn_yes") {
     const state = await getState(env, userId);
     if (!state || state.action !== "post_await_buttons_choice") return;
+    
+    // Check if user has saved buttons from before
+    const savedButtons = await cachedGet(env, `buttons_${userId}`, "json", 3600000);
+    
+    let msg;
+    let keyboard;
+    
+    if (savedButtons && savedButtons.length > 0) {
+      const lastBtnPreview = savedButtons.flat().slice(0, 3).map(b => b.text).join(", ");
+      msg = lang === "fa"
+        ? `⛓ **افزودن دکمه به پست**\n\nفرمت:\n\`Button💠 - https://link.com\`\n\`Button🩵 - http://a.ai | Button💙 - http://b.ai\`\n\n— هر خط = یک ردیف دکمه\n— با \`|\` چند دکمه در یک ردیف\n\n🔹 **دکمه‌های ذخیره‌شده:** ${lastBtnPreview}...\n\nیا دکمه جدید بفرستید.`
+        : `⛓ **Add Buttons**\n\nFormat:\n\`Button💠 - https://link.com\`\n\`Button🩵 - http://a.ai | Button💙 - http://b.ai\`\n\n— each line = one button row\n— use \`|\` for multiple buttons in a row\n\n🔹 **Saved buttons:** ${lastBtnPreview}...\n\nOr send new buttons.`;
+      
+      keyboard = {
+        inline_keyboard: [
+          [{ text: lang === "fa" ? "🔹 استفاده از دکمه‌های قبلی" : "🔹 Use saved buttons", callback_data: "fa_use_saved_buttons" }],
+          [{ text: lang === "fa" ? "❌ لغو" : "❌ Cancel", callback_data: "fa_cancel_flow" }],
+        ],
+      };
+    } else {
+      msg = lang === "fa"
+        ? `⛓ **افزودن دکمه به پست**\n\nفرمت:\n\`Button💠 - https://link.com\`\n\`Button🩵 - http://a.ai | Button💙 - http://b.ai\`\n\n— هر خط = یک ردیف دکمه\n— با \`|\` چند دکمه در یک ردیف\n\nبرای لغو /cancel`
+        : `⛓ **Add Buttons**\n\nFormat:\n\`Button💠 - https://link.com\`\n\`Button🩵 - http://a.ai | Button💙 - http://b.ai\`\n\n— each line = one button row\n— use \`|\` for multiple buttons in a row\n\n/cancel to abort`;
+      keyboard = cancelKeyboard(lang);
+    }
+    
     await setState(env, userId, { ...state, action: "post_await_buttons_text" });
-    const txt = lang === "fa"
-      ? `⛓ **افزودن دکمه به پست**\n\nدکمه‌ها را به فرمت زیر ارسال کنید:\n\nButton💠 - https://link.com\n\nButton🩵 - http://a.ai | Button💙 - http://b.ai\n\nButton🟣 - http://d.ai | Button🟠 - http://c.ai | Button💚 - http://e.ai\n\n— هر خط = یک ردیف دکمه\n— با \`|\` چند دکمه را در یک ردیف قرار دهید\n\nبرای لغو /cancel را ارسال کنید.`
-      : `⛓ **Add Buttons to Post**\n\nSend the buttons in the following format:\n\nButton💠 - https://link.com\n\nButton🩵 - http://a.ai | Button💙 - http://b.ai\n\nButton🟣 - http://d.ai | Button🟠 - http://c.ai | Button💚 - http://e.ai\n\n— each line = one button row\n— use \`|\` to put multiple buttons in one row\n\nSend /cancel to abort.`;
-    await editRichMarkdown(cfg, chatId, msgId, txt, cancelKeyboard(lang));
+    await editRichMarkdown(cfg, chatId, msgId, msg, keyboard);
+    return;
+  }
+
+  if (action === "use_saved_buttons") {
+    const state = await getState(env, userId);
+    if (!state || state.action !== "post_await_buttons_text") return;
+    
+    const savedButtons = await cachedGet(env, `buttons_${userId}`, "json", 3600000);
+    if (!savedButtons || savedButtons.length === 0) {
+      await sendPlain(cfg, chatId, lang === "fa" ? "⚠️ دکمه‌ای ذخیره نشده." : "⚠️ No saved buttons.");
+      return;
+    }
+    
+    // Save these buttons for reuse
+    const newState = { ...state, action: "post_await_poll_choice", buttons: savedButtons, polls: state.polls || [] };
+    await setState(env, userId, newState);
+    
+    const existingPolls = state.polls || [];
+    let msg;
+    if (existingPolls.length > 0) {
+      msg = lang === "fa"
+        ? `✅ دکمه‌های قبلی اعمال شد!\n\n📊 ${existingPolls.length} نظرسنجی از متن شناسایی شد.\n\nنظرسنجی دیگری اضافه کنید یا "✅ ادامه" بزنید.`
+        : `✅ Previous buttons applied!\n\n📊 ${existingPolls.length} poll(s) detected from text.\n\nAdd more or click "✅ Continue".`;
+    } else {
+      msg = lang === "fa"
+        ? "✅ دکمه‌های قبلی اعمال شد!\n\nآیا نظرسنجی اضافه کنید؟"
+        : "✅ Previous buttons applied!\n\nAdd a poll?";
+    }
+    
+    await editRichMarkdown(cfg, chatId, msgId, msg, askPollKeyboard(lang, existingPolls.length > 0));
     return;
   }
 
   if (action === "post_btn_no") {
     const state = await getState(env, userId);
     if (!state || state.action !== "post_await_buttons_choice") return;
-    const newState = { ...state, action: "post_preview", buttons: null };
+    // Keep existing polls (from auto-detect) and ask about adding more
+    const existingPolls = state.polls || [];
+    await setState(env, userId, { ...state, action: "post_await_poll_choice", buttons: null, polls: existingPolls });
+    
+    let msg;
+    if (existingPolls.length > 0) {
+      msg = lang === "fa"
+        ? `📊 ${existingPolls.length} نظرسنجی از متن شناسایی شد!\n\nنظرسنجی دیگری اضافه کنید یا "✅ ادامه" بزنید.`
+        : `📊 ${existingPolls.length} poll(s) detected from text!\n\nAdd more or click "✅ Continue".`;
+    } else {
+      msg = lang === "fa"
+        ? "آیا می‌خواهید **نظرسنجی** یا **کوییز** به پست اضافه کنید؟\n\nمی‌توانید چندین نظرسنجی اضافه کنید!"
+        : "Would you like to add a **poll** or **quiz** to this post?\n\nYou can add multiple polls!";
+    }
+    
+    await editRichMarkdown(cfg, chatId, msgId, msg, askPollKeyboard(lang, existingPolls.length > 0));
+    return;
+  }
+
+  if (action === "post_poll_regular") {
+    const state = await getState(env, userId);
+    if (!state || state.action !== "post_await_poll_choice") return;
+    await setState(env, userId, { ...state, pollType: "regular" });
+    const pollCount = (state.polls || []).length;
+    await editRichMarkdown(cfg, chatId, msgId,
+      lang === "fa"
+        ? `📊 **نظرسنجی ${pollCount + 1}**\n\nسوال و گزینه‌ها را به این فرمت بفرستید:\n\n\`سوال | گزینه۱ | گزینه۲ | گزینه۳\`\n\nمثال:\n\`بهترین زبان؟ | Python | JavaScript | Rust | Go\`\n\nبرای لغو /cancel`
+        : `📊 **Poll ${pollCount + 1}**\n\nSend question and options in this format:\n\n\`Question | Option1 | Option2 | Option3\`\n\nExample:\n\`Best language? | Python | JavaScript | Rust | Go\`\n\n/cancel to abort`,
+      cancelKeyboard(lang));
+    return;
+  }
+
+  if (action === "post_poll_quiz") {
+    const state = await getState(env, userId);
+    if (!state || state.action !== "post_await_poll_choice") return;
+    await setState(env, userId, { ...state, pollType: "quiz" });
+    const pollCount = (state.polls || []).length;
+    await editRichMarkdown(cfg, chatId, msgId,
+      lang === "fa"
+        ? `🎯 **کوییز ${pollCount + 1}**\n\nسوال و گزینه‌ها را بفرستید. گزینه درست را با \`!\` مشخص کنید:\n\n\`سوال | اشتباه | !درست | اشتباه\`\n\nمثال:\n\`پایتخت فرانسه؟ | لندن | !پاریس | برلین\`\n\nبرای لغو /cancel`
+        : `🎯 **Quiz ${pollCount + 1}**\n\nSend question and options. Mark the correct answer with \`!\`:\n\n\`Question | Wrong | !Correct | Wrong\`\n\nExample:\n\`Capital of France? | London | !Paris | Berlin\`\n\n/cancel to abort`,
+      cancelKeyboard(lang));
+    return;
+  }
+
+  if (action === "post_poll_no") {
+    const state = await getState(env, userId);
+    if (!state || state.action !== "post_await_poll_choice") return;
+    const newState = { ...state, action: "post_preview", polls: state.polls || [] };
     await setState(env, userId, newState);
     await sendPostPreview(env, cfg, chatId, newState);
+    return;
+  }
+
+  if (action === "post_poll_done") {
+    const state = await getState(env, userId);
+    if (!state || state.action !== "post_await_poll_choice") return;
+    const newState = { ...state, action: "post_preview", polls: state.polls || [] };
+    await setState(env, userId, newState);
+    await sendPostPreview(env, cfg, chatId, newState);
+    return;
+  }
+
+  // ── Standalone poll creation ────────────────────────────────────────────
+  if (action === "standalone_poll_start") {
+    await setState(env, userId, { action: "standalone_poll_await", lang });
+    await editRichMarkdown(cfg, chatId, msgId,
+      lang === "fa"
+        ? "📊 **ساخت نظرسنجی**\n\nسوال و گزینه‌ها را به این فرمت بفرستید:\n\n`سوال | گزینه۱ | گزینه۲ | گزینه۳`\n\nمثال:\n`بهترین زبان؟ | Python | JavaScript | Rust | Go`\n\nبرای لغو /cancel"
+        : "📊 **Create Poll**\n\nSend question and options:\n\n`Question | Option1 | Option2 | Option3`\n\nExample:\n`Best language? | Python | JavaScript | Rust | Go`\n\n/cancel to abort",
+      cancelKeyboard(lang));
     return;
   }
 
@@ -1885,6 +3059,15 @@ async function handleCallback(cb, env, cfg) {
     return;
   }
 
+  if (action === "post_confirm_back") {
+    const state = await getState(env, userId);
+    if (!state) return;
+    // Go back to post preview
+    await setState(env, userId, { ...state, action: "post_preview" });
+    await sendPostPreview(env, cfg, chatId, { ...state, action: "post_preview" });
+    return;
+  }
+
   // ── Channel selection (tick/untick) ────────────────────────────────
   if (action.startsWith("post_ch_")) {
     const chId = action.slice("post_ch_".length);
@@ -1916,26 +3099,116 @@ async function handleCallback(cb, env, cfg) {
 
     const channels = await getChannels(env);
     const replyMarkup = state.buttons ? { inline_keyboard: state.buttons } : undefined;
+    const polls = state.polls || [];
 
     const results = [];
     for (const chId of selected) {
       const ch = channels.find(c => String(c.id) === String(chId));
       if (!ch) continue;
-      let res;
-      if (state.isHtml) res = await sendRichHtmlResult(cfg, ch.id, state.text, replyMarkup);
-      else res = await sendRichMarkdownResult(cfg, ch.id, state.text, replyMarkup);
-      results.push({ title: ch.title, ok: res?.ok });
+
+      // STEP 1: Send text post FIRST (with buttons if they exist)
+      let textSent = false;
+      if (state.text) {
+        let res;
+        if (state.isHtml) res = await sendRichHtmlResult(cfg, ch.id, state.text, replyMarkup);
+        else res = await sendRichMarkdownResult(cfg, ch.id, state.text, replyMarkup);
+        textSent = res?.ok;
+        results.push({ title: ch.title, ok: res?.ok, textSent: res?.ok });
+      }
+
+      // STEP 2: Send ALL polls SEPARATELY (no buttons - polls don't support inline keyboards)
+      let pollSentCount = 0;
+      for (const poll of polls) {
+        const pollBody = {
+          chat_id: ch.id,
+          question: poll.question,
+          options: poll.options,
+          is_anonymous: poll.anonymous !== false,
+        };
+        if (poll.type === "quiz") {
+          pollBody.type = "quiz";
+          pollBody.correct_option_id = poll.correctOptionId;
+        }
+
+        const pollRes = await tg(cfg, "sendPoll", pollBody);
+        if (pollRes.ok) {
+          const pollRecord = {
+            id: `poll_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+            pollId: pollRes.result.poll.id,
+            question: poll.question,
+            options: poll.options,
+            chatId: ch.id,
+            messageId: pollRes.result.message_id,
+            type: poll.type,
+            anonymous: poll.anonymous !== false,
+            correctOptionId: poll.correctOptionId,
+            createdAt: Date.now(),
+          };
+          await addPoll(env, pollRecord);
+          pollSentCount++;
+        } else {
+          // sendPoll failed, send as text
+          const optionsText = poll.options.map((opt, i) => `  ${i + 1}. ${opt}`).join("\n");
+          const pollText = `📊 ${poll.question}\n\n${optionsText}`;
+          if (state.isHtml) await sendRichHtmlResult(cfg, ch.id, pollText);
+          else await sendRichMarkdownResult(cfg, ch.id, pollText);
+        }
+      }
+      
+      if (polls.length > 0) {
+        results.push({ title: ch.title, ok: pollSentCount === polls.length, pollSent: pollSentCount, pollTotal: polls.length });
+      }
     }
 
     await setState(env, userId, null);
 
-    const lines = results.map(r =>
-      r.ok
-        ? (lang === "fa" ? `✅ با موفقیت در کانال **${r.title}** ارسال شد.` : `✅ Successfully sent to channel **${r.title}**.`)
-        : (lang === "fa" ? `❌ ارسال به کانال **${r.title}** ناموفق بود.` : `❌ Failed to send to channel **${r.title}**.`)
-    );
+    const lines = results.map(r => {
+      let line = r.ok
+        ? (lang === "fa" ? `✅ **${r.title}**` : `✅ **${r.title}**`)
+        : (lang === "fa" ? `❌ **${r.title}**` : `❌ **${r.title}**`);
+      const parts = [];
+      if (r.textSent) parts.push(lang === "fa" ? "📝 متن" : "📝 Text");
+      if (r.pollSent) parts.push(`${lang === "fa" ? "📊 نظرسنجی" : "📊 Poll"} ${r.pollSent}/${r.pollTotal}`);
+      if (parts.length > 0) line += " — " + parts.join(" + ");
+      if (state?.buttons && state.buttons.length > 0) line += lang === "fa" ? " + 🔘 دکمه" : " + 🔘 Buttons";
+      return line;
+    });
     const txt = (lang === "fa" ? "📤 **نتیجه ارسال پست:**\n\n" : "📤 **Post send result:**\n\n") + lines.join("\n");
     await sendRichMarkdown(cfg, chatId, txt, adminPanelKeyboard(lang));
+    return;
+  }
+
+  // ── Post schedule ─────────────────────────────────────────────────
+  if (action === "post_send_now") {
+    const state = await getState(env, userId);
+    if (!state || state.action !== "post_select_channels") return;
+    // Trigger immediate send
+    await handleCallback({ ...cb, data: `${lang}_post_send` }, env, cfg);
+    return;
+  }
+
+  if (action === "post_schedule") {
+    const state = await getState(env, userId);
+    if (!state || state.action !== "post_select_channels") return;
+    const selected = state.selected || [];
+    if (selected.length === 0) {
+      await tg(cfg, "answerCallbackQuery", {
+        callback_query_id: cb.id,
+        text: lang === "fa" ? "⚠️ حداقل یک کانال انتخاب کنید." : "⚠️ Select at least one channel.",
+        show_alert: true,
+      });
+      return;
+    }
+    
+    // Store selected channels and show calendar
+    await setState(env, userId, { ...state, action: "schedule_pick_date", selectedChannels: selected });
+    
+    const now = new Date();
+    await editRichMarkdown(cfg, chatId, msgId,
+      lang === "fa"
+        ? "📅 **تاریخ ارسال را انتخاب کنید:**"
+        : "📅 **Pick a send date:**",
+      calendarKeyboard(now.getFullYear(), now.getMonth(), lang));
     return;
   }
 }
@@ -2068,7 +3341,11 @@ function json(data, status = 200) {
  * Returns { ok: true, text } on success or { ok: false, error } on failure.
  * The caller is responsible for surfacing the error to the user.
  */
-async function callAi(env, messages) {
+/**
+ * Call AI API with retry logic and better error handling.
+ * Supports streaming for better UX.
+ */
+async function callAi(env, messages, options = {}) {
   const config = await getAiConfig(env);
   if (!config.apiKey) {
     return { ok: false, error: "AI not configured. Admin must use /aiconfig to set up." };
@@ -2077,33 +3354,113 @@ async function callAi(env, messages) {
     return { ok: false, error: "AI base URL not set. Use /aiconfig custom <key> <baseUrl>." };
   }
 
-  try {
-    const res = await fetch(`${config.baseUrl}/chat/completions`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${config.apiKey}`,
-      },
-      body: JSON.stringify({
-        model: config.model,
-        messages: [{ role: "system", content: config.systemPrompt }, ...messages],
-        temperature: 0.7,
-        max_tokens: 2000,
-      }),
-      // Cloudflare Workers have a 30s wall-clock limit on the free plan.
-      // The AI call should finish well within that for short content.
-    });
-    const data = await res.json();
-    if (!res.ok) {
-      const msg = data.error?.message || data.error || `API error ${res.status}`;
-      return { ok: false, error: typeof msg === "string" ? msg : JSON.stringify(msg) };
+  const maxRetries = 2;
+  let lastError = null;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 60000); // 60s timeout
+
+      const res = await fetch(`${config.baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${config.apiKey}`,
+        },
+        body: JSON.stringify({
+          model: config.model,
+          messages: [{ role: "system", content: config.systemPrompt }, ...messages],
+          temperature: options.temperature || 0.7,
+          max_tokens: options.maxTokens || 4000,
+          stream: options.stream || false,
+        }),
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeoutId);
+
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        const msg = data.error?.message || data.error || `API error ${res.status}`;
+        lastError = typeof msg === "string" ? msg : JSON.stringify(msg);
+        
+        // Don't retry on auth errors
+        if (res.status === 401 || res.status === 403) {
+          return { ok: false, error: `Auth error: ${lastError}` };
+        }
+        
+        // Retry on rate limit or server errors
+        if (res.status === 429 || res.status >= 500) {
+          if (attempt < maxRetries) {
+            await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+            continue;
+          }
+        }
+        
+        return { ok: false, error: lastError };
+      }
+
+      // Handle streaming response
+      if (options.stream) {
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let fullText = "";
+        
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          
+          const chunk = decoder.decode(value);
+          const lines = chunk.split("\n").filter(l => l.startsWith("data: "));
+          
+          for (const line of lines) {
+            if (line === "data: [DONE]") break;
+            try {
+              const data = JSON.parse(line.slice(6));
+              const delta = data.choices?.[0]?.delta?.content;
+              if (delta) fullText += delta;
+            } catch {}
+          }
+        }
+        
+        if (!fullText) return { ok: false, error: "AI returned empty response." };
+        return { ok: true, text: fullText };
+      }
+
+      // Handle non-streaming response
+      const data = await res.json();
+      const text = data.choices?.[0]?.message?.content || "";
+      if (!text) return { ok: false, error: "AI returned empty response." };
+      
+      // Include usage stats if available
+      const usage = data.usage;
+      return { 
+        ok: true, 
+        text,
+        usage: usage ? {
+          promptTokens: usage.prompt_tokens,
+          completionTokens: usage.completion_tokens,
+          totalTokens: usage.total_tokens,
+        } : undefined,
+      };
+    } catch (err) {
+      lastError = String(err?.message || err);
+      
+      // Don't retry on abort (timeout)
+      if (err.name === "AbortError") {
+        return { ok: false, error: "AI request timed out (60s). Try a shorter prompt." };
+      }
+      
+      // Retry on network errors
+      if (attempt < maxRetries) {
+        await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+        continue;
+      }
     }
-    const text = data.choices?.[0]?.message?.content || "";
-    if (!text) return { ok: false, error: "AI returned empty response." };
-    return { ok: true, text };
-  } catch (err) {
-    return { ok: false, error: String(err?.message || err) };
   }
+
+  return { ok: false, error: `AI failed after ${maxRetries + 1} attempts: ${lastError}` };
 }
 
 /**
@@ -2113,18 +3470,21 @@ async function callAi(env, messages) {
 async function handleAiGenerate(env, cfg, chatId, userId, prompt, existingState) {
   const aiConfig = await getAiConfig(env);
   if (!aiConfig.apiKey) {
-    await sendPlain(cfg, chatId, "⚠️ AI not configured. Admin must use /aiconfig first.\n\nExample: `/aiconfig openai sk-your-key`");
+    await sendPlain(cfg, chatId, langFa(cfg, userId)
+      ? "⚠️ هوش مصنوعی تنظیم نشده. ادمین باید از /aiconfig استفاده کند.\n\nمثال: `/aiconfig openai sk-your-key`"
+      : "⚠️ AI not configured. Admin must use /aiconfig first.\n\nExample: `/aiconfig openai sk-your-key`");
     return;
   }
 
-  await sendPlain(cfg, chatId, "🤖 Generating...");
+  await sendPlain(cfg, chatId, "🤖 " + (langFa(cfg, userId) ? "در حال تولید..." : "Generating..."));
+  
   const result = await callAi(env, [{ role: "user", content: prompt }]);
   if (!result.ok) {
     await sendPlain(cfg, chatId, `❌ AI error: ${result.error}`);
     return;
   }
 
-  const lang = existingState?.lang || "fa";
+  const lang = existingState?.lang || (langFa(cfg, userId) ? "fa" : "en");
   const newState = {
     action: "ai_preview",
     lang,
@@ -2139,10 +3499,15 @@ async function handleAiGenerate(env, cfg, chatId, userId, prompt, existingState)
   if (isHtml) await sendRichHtml(cfg, chatId, result.text);
   else await sendRichMarkdown(cfg, chatId, result.text);
 
+  // Show usage stats if available
+  const usageText = result.usage
+    ? `\n📊 Tokens: ${result.usage.totalTokens} (↑${result.usage.promptTokens} ↓${result.usage.completionTokens})`
+    : "";
+
   await sendPlain(cfg, chatId,
-    lang === "fa"
+    (lang === "fa"
       ? "👆 محتوای تولید‌شده. چه کار کنم؟"
-      : "👆 AI-generated content. What next?",
+      : "👆 AI-generated content. What next?") + usageText,
     aiPreviewKeyboard(lang)
   );
 }
@@ -2243,7 +3608,7 @@ async function showScheduledList(env, cfg, chatId, userId, msgId, lang) {
   }
 
   const lines = sorted.slice(0, 15).map(p => {
-    const dateStr = new Date(p.sendAt).toISOString().replace("T", " ").slice(0, 16) + " UTC";
+    const dateStr = new Date(p.sendAt + TIMEZONE_OFFSET_MS).toISOString().replace("T", " ").slice(0, 16).replace("Z", "") + " (IR)";
     const status = p.sent
       ? (lang === "fa" ? "✅ ارسال شد" : "✅ Sent")
       : (p.sendAt <= now
@@ -2277,6 +3642,10 @@ async function showScheduledList(env, cfg, chatId, userId, msgId, lang) {
  * Picks up due scheduled AI posts, sends them, marks them sent.
  * If `viaHttp` is true, returns a JSON response (for the /run-scheduler endpoint).
  */
+/**
+ * Run all due scheduled posts.
+ * Enhanced with retry logic and better error handling.
+ */
 async function runScheduledPosts(env, cfg, viaHttp) {
   const posts = await getScheduledPosts(env);
   const now = Date.now();
@@ -2288,48 +3657,212 @@ async function runScheduledPosts(env, cfg, viaHttp) {
   }
 
   let sentCount = 0;
+  let failedCount = 0;
   const results = [];
 
   for (const post of due) {
     const channelResults = [];
+    const postState = post.postState || {};
+    const text = post.generatedText || postState.text || "";
+    const retryCount = post.retryCount || 0;
+    const maxRetries = 3;
+
     for (const chId of post.channelIds) {
       try {
-        const isHtml = post.generatedText.startsWith("<") || /<\/?\w/.test(post.generatedText);
-        const res = isHtml
-          ? await sendRichHtmlResult(cfg, chId, post.generatedText)
-          : await sendRichMarkdownResult(cfg, chId, post.generatedText);
-        channelResults.push({ channelId: chId, ok: !!res?.ok });
+        // Send text post if there's text content
+        let textOk = true;
+        if (text) {
+          const isHtml = text.startsWith("<") || /<\/?\w/.test(text);
+          const replyMarkup = postState.buttons ? { inline_keyboard: postState.buttons } : undefined;
+          const res = isHtml
+            ? await sendRichHtmlResult(cfg, chId, text, replyMarkup)
+            : await sendRichMarkdownResult(cfg, chId, text, replyMarkup);
+          textOk = !!res?.ok;
+          
+          if (!textOk) {
+            channelResults.push({ 
+              channelId: chId, 
+              ok: false, 
+              error: res?.description || "Send failed",
+              retryable: true 
+            });
+            continue;
+          }
+        }
+
+        // Send poll if exists
+        let pollOk = false;
+        if (postState.poll) {
+          const poll = postState.poll;
+          const pollBody = {
+            chat_id: chId,
+            question: poll.question,
+            options: poll.options,
+            is_anonymous: poll.anonymous !== false,
+          };
+          if (poll.type === "quiz") {
+            pollBody.type = "quiz";
+            pollBody.correct_option_id = poll.correctOptionId;
+          }
+          const pollRes = await tg(cfg, "sendPoll", pollBody);
+          pollOk = !!pollRes?.ok;
+
+          if (pollOk) {
+            const pollRecord = {
+              id: `poll_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+              pollId: pollRes.result.poll.id,
+              question: poll.question,
+              options: poll.options,
+              chatId: chId,
+              messageId: pollRes.result.message_id,
+              type: poll.type,
+              anonymous: poll.anonymous !== false,
+              correctOptionId: poll.correctOptionId,
+              createdAt: Date.now(),
+            };
+            await addPoll(env, pollRecord);
+          }
+        }
+
+        channelResults.push({ channelId: chId, ok: true, pollSent: pollOk });
       } catch (err) {
-        channelResults.push({ channelId: chId, ok: false, error: String(err) });
+        channelResults.push({ 
+          channelId: chId, 
+          ok: false, 
+          error: String(err),
+          retryable: true 
+        });
       }
     }
-    post.sent = true;
-    post.sentAt = now;
-    post.sendResults = channelResults;
-    sentCount++;
-    results.push({ id: post.id, channels: channelResults });
+
+    const allOk = channelResults.every(r => r.ok);
+    const anyRetryable = channelResults.some(r => r.retryable);
+
+    if (allOk) {
+      post.sent = true;
+      post.sentAt = now;
+      post.sendResults = channelResults;
+      sentCount++;
+    } else if (anyRetryable && retryCount < maxRetries) {
+      // Retry later (exponential backoff: 1min, 5min, 15min)
+      const backoffMs = [60000, 300000, 900000][retryCount] || 900000;
+      post.retryCount = retryCount + 1;
+      post.retryAt = now + backoffMs;
+      post.sendResults = channelResults;
+      failedCount++;
+    } else {
+      // Max retries exceeded or non-retryable error
+      post.sent = true;
+      post.sentAt = now;
+      post.failed = true;
+      post.sendResults = channelResults;
+      failedCount++;
+    }
+
+    results.push({ 
+      id: post.id, 
+      channels: channelResults,
+      status: allOk ? "sent" : (anyRetryable && retryCount < maxRetries ? "retrying" : "failed")
+    });
   }
 
   await saveScheduledPosts(env, posts);
 
   if (viaHttp) {
-    return json({ ok: true, sent: sentCount, results });
+    return json({ 
+      ok: true, 
+      sent: sentCount, 
+      failed: failedCount,
+      results 
+    });
   }
-  return { sent: sentCount };
+  return { sent: sentCount, failed: failedCount };
+}
+
+/**
+ * Handle /scheduled command - list all scheduled posts with details.
+ */
+async function handleScheduledList(env, cfg, chatId, userId, msgId, lang) {
+  const posts = await getScheduledPosts(env);
+  
+  if (posts.length === 0) {
+    const txt = lang === "fa"
+      ? "📋 هیچ زمان‌بندی ثبت نشده.\n\nبرای ثبت: /scheduleai"
+      : "📋 No scheduled posts.\n\nTo schedule: /scheduleai";
+    if (msgId) await editRichMarkdown(cfg, chatId, msgId, txt, backKeyboard(lang));
+    else await sendPlain(cfg, chatId, txt);
+    return;
+  }
+
+  const lines = [];
+  const pending = posts.filter(p => !p.sent);
+  const sent = posts.filter(p => p.sent && !p.failed);
+  const failed = posts.filter(p => p.failed);
+
+  if (pending.length > 0) {
+    lines.push(lang === "fa" ? "⏳ **در انتظار ارسال:**\n" : "⏳ **Pending:**\n");
+    for (const post of pending.slice(-5)) {
+      const dateStr = new Date(post.sendAt).toLocaleString(lang === "fa" ? "fa-IR" : "en-US");
+      const channels = post.channelIds.length;
+      lines.push(`   📌 \`${post.id}\`\n      📅 ${dateStr}\n      📡 ${channels} ${lang === "fa" ? "کانال" : "channels"}\n`);
+    }
+  }
+
+  if (failed.length > 0) {
+    lines.push(lang === "fa" ? "\n❌ **ناموفق:**\n" : "\n❌ **Failed:**\n");
+    for (const post of failed.slice(-3)) {
+      const dateStr = new Date(post.sentAt || post.sendAt).toLocaleString(lang === "fa" ? "fa-IR" : "en-US");
+      const errors = (post.sendResults || []).filter(r => !r.ok).map(r => r.error).join(", ");
+      lines.push(`   📌 \`${post.id}\`\n      📅 ${dateStr}\n      ⚠️ ${errors.slice(0, 50)}\n`);
+    }
+  }
+
+  const summary = lang === "fa"
+    ? `📋 **زمان‌بندی‌ها** (${posts.length})\n\n⏳ ${pending.length} در انتظار · ✅ ${sent.length} ارسال‌شده · ❌ ${failed.length} ناموفق\n\n`
+    : `📋 **Scheduled Posts** (${posts.length})\n\n⏳ ${pending.length} pending · ✅ ${sent.length} sent · ❌ ${failed.length} failed\n\n`;
+
+  const txt = summary + lines.join("\n");
+
+  if (msgId) await editRichMarkdown(cfg, chatId, msgId, txt, backKeyboard(lang));
+  else await sendRichMarkdown(cfg, chatId, txt, backKeyboard(lang));
+}
+
+/**
+ * Handle /cancel <id> command - cancel a scheduled post.
+ */
+async function handleCancelScheduled(env, cfg, chatId, userId, postId, lang) {
+  const posts = await getScheduledPosts(env);
+  const post = posts.find(p => p.id === postId && !p.sent);
+  
+  if (!post) {
+    await sendPlain(cfg, chatId, lang === "fa"
+      ? `❌ زمان‌بندی \`${postId}\` یافت نشد یا قبلاً ارسال شده.`
+      : `❌ Scheduled post \`${postId}\` not found or already sent.`);
+    return;
+  }
+
+  // Remove from list
+  const idx = posts.indexOf(post);
+  posts.splice(idx, 1);
+  await saveScheduledPosts(env, posts);
+
+  await sendPlain(cfg, chatId, lang === "fa"
+    ? `✅ زمان‌بندی \`${postId}\` لغو شد.`
+    : `✅ Scheduled post \`${postId}\` cancelled.`);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  MEDIA DOWNLOADER  —  cobalt API + GitHub direct
+//  MEDIA DOWNLOADER  —  Multi-backend (RapidAPI / cobalt / GitHub direct)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
  * Handle /dl <url> — detect source, fetch media, send to chat.
  * Supports:
  *   • GitHub (raw, blob, releases) → fetch directly
- *   • Everything else → cobalt API (YouTube, Spotify, TikTok, Instagram, etc.)
+ *   • YouTube/TikTok/Instagram/Twitter → RapidAPI (if configured) or cobalt
+ *   • Everything else → cobalt API
  */
 async function handleDownload(cfg, chatId, userId, url) {
-  // Basic URL validation
   if (!/^https?:\/\//i.test(url)) {
     await sendPlain(cfg, chatId, "⚠️ Please send a valid URL starting with http:// or https://");
     return;
@@ -2338,23 +3871,160 @@ async function handleDownload(cfg, chatId, userId, url) {
   await sendPlain(cfg, chatId, "📥 Downloading...");
 
   try {
-    // GitHub special handling (cobalt doesn't do GitHub)
+    // GitHub special handling
     if (/github\.com|raw\.githubusercontent\.com|gist\.github\.com/i.test(url)) {
       const result = await downloadFromGithub(cfg, chatId, url);
-      if (result.handled) return; // either sent or error reported
+      if (result.handled) return;
     }
 
-    // Cobalt for everything else (YouTube, Spotify, TikTok, Instagram, Twitter/X, SoundCloud, etc.)
+    // Detect platform for RapidAPI routing
+    const platform = detectPlatform(url);
+
+    // Try RapidAPI first if configured and platform is supported
+    if (cfg.rapidApiKey && platform) {
+      const rapidResult = await downloadViaRapidApi(url, platform, cfg);
+      if (rapidResult.ok) {
+        await sendMediaFile(cfg, chatId, rapidResult.url, rapidResult.filename, rapidResult.type);
+        return;
+      }
+      // RapidAPI failed — fall through to cobalt
+    }
+
+    // Fallback to cobalt
     const cobaltResult = await downloadViaCobalt(url, cfg.cobaltUrl);
     if (!cobaltResult.ok) {
-      await sendPlain(cfg, chatId, `❌ Download failed: ${cobaltResult.error}\n\nThe URL may not be supported, or the cobalt service is unavailable. You can self-host cobalt and set COBALT_API_URL.`);
+      const errorMsg = cfg.rapidApiKey
+        ? `❌ Download failed: ${cobaltResult.error}\n\nBoth RapidAPI and cobalt failed. The URL may not be supported.`
+        : `❌ Download failed: ${cobaltResult.error}\n\nSet RAPIDAPI_KEY for more platform support, or self-host cobalt.`;
+      await sendPlain(cfg, chatId, errorMsg);
       return;
     }
 
-    // Send the media file to the chat
     await sendMediaFile(cfg, chatId, cobaltResult.url, cobaltResult.filename, cobaltResult.type);
   } catch (err) {
     await sendPlain(cfg, chatId, `❌ Error: ${err?.message || err}`);
+  }
+}
+
+/**
+ * Detect the platform from a URL.
+ * Returns a platform key for RapidAPI routing, or null if unknown.
+ */
+function detectPlatform(url) {
+  if (/youtube\.com|youtu\.be/i.test(url)) return "youtube";
+  if (/tiktok\.com/i.test(url)) return "tiktok";
+  if (/instagram\.com/i.test(url)) return "instagram";
+  if (/twitter\.com|x\.com/i.test(url)) return "twitter";
+  if (/facebook\.com|fb\.watch/i.test(url)) return "facebook";
+  if (/reddit\.com/i.test(url)) return "reddit";
+  if (/pinterest\.(com|ca|co\.\w+)/i.test(url)) return "pinterest";
+  return null;
+}
+
+/**
+ * Call RapidAPI to resolve a media URL.
+ * Returns { ok, url, filename, type } or { ok: false, error }.
+ *
+ * RapidAPI services used (configurable via env):
+ *   RAPIDAPI_YOUTUBE_KEY  → "youtube-media-downloader" or similar
+ *   RAPIDAPI_TIKTOK_KEY   → "tiktok-video-downloader" or similar
+ *   RAPIDAPI_IG_KEY       → "instagram-downloader" or similar
+ *   RAPIDAPI_KEY          → fallback key for all platforms
+ */
+async function downloadViaRapidApi(url, platform, cfg) {
+  try {
+    // Map platform to RapidAPI service + host
+    const services = {
+      youtube: {
+        host: cfg.rapidApiYoutubeHost || "youtube-media-downloader1.p.rapidapi.com",
+        key: cfg.rapidApiYoutubeKey || cfg.rapidApiKey,
+        endpoint: "/download",
+        buildBody: (u) => ({ url: u }),
+      },
+      tiktok: {
+        host: cfg.rapidApiTiktokHost || "tiktok-downloader-api-tiktok.p.rapidapi.com",
+        key: cfg.rapidApiTiktokKey || cfg.rapidApiKey,
+        endpoint: "/video_no_watermark",
+        buildBody: (u) => ({ url: u }),
+      },
+      instagram: {
+        host: cfg.rapidApiIgHost || "instagram-downloader.p.rapidapi.com",
+        key: cfg.rapidApiIgKey || cfg.rapidApiKey,
+        endpoint: "/download",
+        buildBody: (u) => ({ url: u }),
+      },
+      twitter: {
+        host: cfg.rapidApiTwitterHost || "twitter-api45.p.rapidapi.com",
+        key: cfg.rapidApiTwitterKey || cfg.rapidApiKey,
+        endpoint: "/timeline.php",
+        buildBody: (u) => ({ url: u }),
+      },
+      facebook: {
+        host: cfg.rapidApiFbHost || "facebook-reel-and-video-downloader.p.rapidapi.com",
+        key: cfg.rapidApiFbKey || cfg.rapidApiKey,
+        endpoint: "/app.php",
+        buildBody: (u) => ({ url: u }),
+      },
+      reddit: {
+        host: cfg.rapidApiRedditHost || "reddit-downloader.p.rapidapi.com",
+        key: cfg.rapidApiRedditKey || cfg.rapidApiKey,
+        endpoint: "/download",
+        buildBody: (u) => ({ url: u }),
+      },
+      pinterest: {
+        host: cfg.rapidApiPinterestHost || "pinterest-downloader.p.rapidapi.com",
+        key: cfg.rapidApiPinterestKey || cfg.rapidApiKey,
+        endpoint: "/download",
+        buildBody: (u) => ({ url: u }),
+      },
+    };
+
+    const service = services[platform];
+    if (!service) return { ok: false, error: `No RapidAPI service for ${platform}` };
+
+    const apiUrl = `https://${service.host}${service.endpoint}`;
+    const body = service.buildBody(url);
+
+    const res = await fetch(apiUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-RapidAPI-Key": service.key,
+        "X-RapidAPI-Host": service.host,
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (!res.ok) {
+      return { ok: false, error: `RapidAPI HTTP ${res.status}` };
+    }
+
+    const data = await res.json();
+
+    // Extract download URL from various response formats
+    const downloadUrl =
+      data.url ||
+      data.download_url ||
+      data.video_url ||
+      data.media_url ||
+      data.result?.url ||
+      data.data?.url ||
+      data.data?.video ||
+      data.data?.download_url ||
+      (Array.isArray(data.data) && data.data[0]?.url) ||
+      (Array.isArray(data.data) && data.data[0]?.download) ||
+      null;
+
+    if (!downloadUrl) {
+      return { ok: false, error: `RapidAPI returned no download URL for ${platform}` };
+    }
+
+    const filename = extractFilename(downloadUrl, platform);
+    const type = platform === "youtube" ? "video" : "video";
+
+    return { ok: true, url: downloadUrl, filename, type };
+  } catch (err) {
+    return { ok: false, error: `RapidAPI ${platform} failed: ${err?.message || err}` };
   }
 }
 
@@ -2379,7 +4049,6 @@ async function downloadViaCobalt(url, cobaltUrl) {
       return { ok: false, error: typeof errCode === "string" ? errCode : JSON.stringify(errCode) };
     }
 
-    // cobalt returns { status: "redirect"|"stream", url, filename, ... }
     if (data.status === "redirect" || data.status === "stream") {
       return {
         ok: true,
@@ -2393,6 +4062,20 @@ async function downloadViaCobalt(url, cobaltUrl) {
   } catch (err) {
     return { ok: false, error: `Cobalt request failed: ${err?.message || err}` };
   }
+}
+
+/**
+ * Extract a filename from a URL for a given platform.
+ */
+function extractFilename(url, platform) {
+  try {
+    const u = new URL(url);
+    const pathParts = u.pathname.split("/").filter(Boolean);
+    const last = pathParts[pathParts.length - 1];
+    if (last && last.includes(".")) return last;
+  } catch {}
+  const id = Date.now().toString(36);
+  return `${platform}_${id}.mp4`;
 }
 
 /**
@@ -2572,27 +4255,61 @@ async function downloadFromGithub(cfg, chatId, url) {
 /**
  * Handle /poll or /quiz command.
  * Format: /poll Question | option1 | option2 | ...
+ * Format: /poll! Question | option1 | option2 | ...  (non-anonymous)
  * Format: /quiz Question | option1 | option2 | !option3  (option3 is correct)
+ * Format: /quiz! Question | option1 | !option2 | option3  (non-anonymous quiz)
+ * Options: Add :<time>m or :<time>h for expiration (e.g., :30m, :2h)
  */
 async function handlePollCommand(env, cfg, chatId, userId, cmd, argText) {
+  // Check for non-anonymous flag (!)
+  const isAnonymous = !cmd.endsWith("!");
+  const actualCmd = cmd.endsWith("!") ? cmd.slice(0, -1) : cmd;
+  
   // Parse "question | opt1 | opt2 | ..."
   const parts = argText.split("|").map(s => s.trim()).filter(s => s.length > 0);
   if (parts.length < 3) {
     await sendPlain(cfg, chatId,
-      "⚠️ Format:\n" +
-      "`/poll Question? | Option 1 | Option 2 | Option 3`\n\n" +
-      "For quiz (one correct answer marked with `!`):\n" +
-      "`/quiz Capital of France? | London | !Paris | Berlin`"
+      langFa(cfg, userId)
+        ? "⚠️ فرمت:\n\n" +
+          "`/poll سوال؟ | گزینه ۱ | گزینه ۲ | گزینه ۳`\n\n" +
+          "برای نظرسنجی غیر-anonymous:\n" +
+          "`/poll! سوال؟ | گزینه ۱ | گزینه ۲`\n\n" +
+          "برای مسابقه (یک پاسخ صحیح با `!`):\n" +
+          "`/quiz پایتخت فرانسه؟ | لندن | !پاریس | برلین`\n\n" +
+          "محدودیت زمانی (اختیاری):\n" +
+          "`/poll سوال؟ | گزینه۱ | گزینه۲ | :30m`\n" +
+          "`/poll سوال؟ | گزینه۱ | گزینه۲ | :2h`"
+        : "⚠️ Format:\n\n" +
+          "`/poll Question? | Option 1 | Option 2 | Option 3`\n\n" +
+          "For non-anonymous poll:\n" +
+          "`/poll! Question? | Option 1 | Option 2`\n\n" +
+          "For quiz (correct answer marked with `!`):\n" +
+          "`/quiz Capital of France? | London | !Paris | Berlin`\n\n" +
+          "Time limit (optional):\n" +
+          "`/poll Q? | Opt1 | Opt2 | :30m`\n" +
+          "`/poll Q? | Opt1 | Opt2 | :2h`"
     );
     return;
   }
 
-  const question = parts[0];
+  let question = parts[0];
   let options = parts.slice(1);
   let correctOptionId = -1;
+  let closeDate = null;
+
+  // Check for time limit in last option
+  const lastOpt = options[options.length - 1];
+  const timeMatch = lastOpt.match(/^:(\d+)(m|h|s)$/);
+  if (timeMatch) {
+    const num = parseInt(timeMatch[1]);
+    const unit = timeMatch[2];
+    const ms = unit === "s" ? num * 1000 : unit === "m" ? num * 60000 : num * 3600000;
+    closeDate = Math.floor((Date.now() + ms) / 1000); // Telegram uses Unix timestamp
+    options = options.slice(0, -1);
+  }
 
   // For /quiz, find the option marked with "!" prefix
-  if (cmd === "quiz") {
+  if (actualCmd === "quiz") {
     options = options.map((opt, idx) => {
       if (opt.startsWith("!")) {
         correctOptionId = idx;
@@ -2601,27 +4318,35 @@ async function handlePollCommand(env, cfg, chatId, userId, cmd, argText) {
       return opt;
     });
     if (correctOptionId === -1) {
-      await sendPlain(cfg, chatId, "⚠️ For /quiz, mark the correct answer with `!`:\n`/quiz Q | wrong | !correct | wrong`");
+      await sendPlain(cfg, chatId, langFa(cfg, userId)
+        ? "⚠️ برای /quiz، پاسخ صحیح را با `!` علامت بزنید:\n`/quiz سوال؟ | غلط | !صحیح | غلط`"
+        : "⚠️ For /quiz, mark the correct answer with `!`:\n`/quiz Q? | wrong | !correct | wrong`");
       return;
     }
   }
 
   // Telegram requires 2-10 options
   if (options.length < 2 || options.length > 10) {
-    await sendPlain(cfg, chatId, "⚠️ Polls need 2-10 options.");
+    await sendPlain(cfg, chatId, langFa(cfg, userId)
+      ? "⚠️ نظرسنجی به ۲ تا ۱۰ گزینه نیاز دارد."
+      : "⚠️ Polls need 2-10 options.");
     return;
   }
 
   const body = {
     chat_id: chatId,
     question,
-    options: JSON.stringify(options),
-    is_anonymous: false, // so we can track who voted what
+    options: options,
+    is_anonymous: isAnonymous,
   };
 
-  if (cmd === "quiz") {
+  if (actualCmd === "quiz") {
     body.type = "quiz";
     body.correct_option_id = correctOptionId;
+  }
+
+  if (closeDate) {
+    body.close_date = closeDate;
   }
 
   const res = await tg(cfg, "sendPoll", body);
@@ -2640,16 +4365,48 @@ async function handlePollCommand(env, cfg, chatId, userId, cmd, argText) {
     options,
     chatId,
     messageId: pollMsg.message_id,
-    type: cmd === "quiz" ? "quiz" : "regular",
+    type: actualCmd === "quiz" ? "quiz" : "regular",
+    anonymous: isAnonymous,
     correctOptionId: correctOptionId >= 0 ? correctOptionId : null,
+    closeDate: closeDate ? closeDate * 1000 : null,
     createdAt: Date.now(),
   };
   await addPoll(env, pollRecord);
 
+  const anonText = isAnonymous
+    ? (langFa(cfg, userId) ? "🔒 Anonymous" : "🔒 Anonymous")
+    : (langFa(cfg, userId) ? "👁 Visible" : "👁 Visible");
+  const timeText = closeDate
+    ? (langFa(cfg, userId) ? `⏰ ${formatDuration(closeDate * 1000 - Date.now(), "fa")}` : `⏰ ${formatDuration(closeDate * 1000 - Date.now(), "en")}`)
+    : (langFa(cfg, userId) ? "♾ بدون محدودیت" : "♾ No limit");
+
   await sendPlain(cfg, chatId,
-    `📊 Poll created! Track results with /pollstats\nPoll ID: \`${pollRecord.id}\``,
-    { inline_keyboard: [[{ text: "📋 View All Polls", callback_data: "fa_poll_list" }]] }
+    langFa(cfg, userId)
+      ? `✅ نظرسنجی ساخته شد!\n\n${anonText} · ${timeText}\nشناسه: \`${pollRecord.id}\``
+      : `✅ Poll created!\n\n${anonText} · ${timeText}\nID: \`${pollRecord.id}\``,
+    { inline_keyboard: [[{ text: langFa(cfg, userId) ? "📋 لیست نظرسنجی‌ها" : "📋 View All Polls", callback_data: "fa_poll_list" }]] }
   );
+}
+
+/**
+ * Format duration as human-readable string.
+ */
+function formatDuration(ms, lang) {
+  const seconds = Math.floor(ms / 1000);
+  const minutes = Math.floor(seconds / 60);
+  const hours = Math.floor(minutes / 60);
+  const days = Math.floor(hours / 24);
+
+  if (lang === "fa") {
+    if (days > 0) return `${days} روز`;
+    if (hours > 0) return `${hours} ساعت`;
+    if (minutes > 0) return `${minutes} دقیقه`;
+    return `${seconds} ثانیه`;
+  }
+  if (days > 0) return `${days}d`;
+  if (hours > 0) return `${hours}h`;
+  if (minutes > 0) return `${minutes}m`;
+  return `${seconds}s`;
 }
 
 /**
@@ -2671,9 +4428,7 @@ async function handlePollAnswer(answer, env) {
 
 /**
  * Show all tracked polls with their current vote counts.
- * Fetches live poll data from Telegram via getPolls (stopPoll with no close_date
- * returns current state) — but actually, we use the stored PollAnswer data
- * since bots can't query arbitrary poll results without the message.
+ * Enhanced with better statistics and voter information.
  */
 async function showPollStats(env, cfg, chatId, userId, msgId, lang) {
   const polls = await getPolls(env);
@@ -2688,31 +4443,69 @@ async function showPollStats(env, cfg, chatId, userId, msgId, lang) {
   }
 
   const lines = [];
+  let totalVotes = 0;
+  let activePolls = 0;
+
   for (const poll of polls.slice(-10)) {  // last 10 polls
     const answers = await getPollAnswers(env, poll.pollId);
     const voteCounts = poll.options.map(() => 0);
+    const voterMap = new Map(); // userId -> optionIds
+    
     for (const a of answers) {
+      voterMap.set(a.userId, a.optionIds);
       for (const optId of a.optionIds) {
         if (voteCounts[optId] !== undefined) voteCounts[optId]++;
       }
     }
-    const totalVotes = voteCounts.reduce((s, c) => s + c, 0);
+    
+    const pollTotalVotes = voteCounts.reduce((s, c) => s + c, 0);
+    totalVotes += pollTotalVotes;
+    
     const dateStr = new Date(poll.createdAt).toISOString().slice(0, 10);
+    const isActive = poll.closeDate ? poll.closeDate > Date.now() : true;
+    if (isActive) activePolls++;
+    
+    const statusIcon = isActive ? "🟢" : "🔴";
+    const typeIcon = poll.type === "quiz" ? "🧠" : "📊";
+    const anonIcon = poll.anonymous === false ? "👁" : "🔒";
 
-    let pollLine = `📊 **${poll.question}**\n`;
-    pollLine += `   🆔 \`${poll.id}\` · 📅 ${dateStr} · 👥 ${totalVotes} votes · ${poll.type}\n`;
+    let pollLine = `${statusIcon} ${typeIcon} **${poll.question}**\n`;
+    pollLine += `   🆔 \`${poll.id}\` · 📅 ${dateStr} · 👥 ${pollTotalVotes} ${lang === "fa" ? "رأی" : "votes"} · ${anonIcon}\n`;
+    
     poll.options.forEach((opt, idx) => {
-      const pct = totalVotes > 0 ? Math.round(voteCounts[idx] / totalVotes * 100) : 0;
-      const bar = "█".repeat(Math.round(pct / 10)).padEnd(10, "░");
+      const pct = pollTotalVotes > 0 ? Math.round(voteCounts[idx] / pollTotalVotes * 100) : 0;
+      const barLen = Math.round(pct / 10);
+      const bar = "█".repeat(barLen).padEnd(10, "░");
       const correct = poll.type === "quiz" && poll.correctOptionId === idx ? " ✅" : "";
-      pollLine += `   ${bar} ${pct}% ${opt} (${voteCounts[idx]})${correct}\n`;
+      pollLine += `   ${bar} ${pct.toString().padStart(3)}% ${opt} (${voteCounts[idx]})${correct}\n`;
     });
+    
+    // Show voter names if not anonymous
+    if (poll.anonymous === false && voterMap.size > 0) {
+      const voterList = Array.from(voterMap.entries()).slice(0, 5).map(([uid, opts]) => {
+        const optNames = opts.map(o => poll.options[o] || `?${o}`).join(", ");
+        return `      • ${uid}: ${optNames}`;
+      }).join("\n");
+      pollLine += `   👤 Voters:\n${voterList}`;
+      if (voterMap.size > 5) {
+        pollLine += `\n      ... +${voterMap.size - 5} more`;
+      }
+    }
+    
+    // Show time remaining if has expiration
+    if (poll.closeDate && isActive) {
+      const remaining = poll.closeDate - Date.now();
+      pollLine += `   ⏰ ${lang === "fa" ? "زمان باقیمانده" : "Time left"}: ${formatDuration(remaining, lang)}\n`;
+    }
+    
     lines.push(pollLine);
   }
 
-  const txt = (lang === "fa"
-    ? `📊 **نظرسنجی‌ها** (${polls.length})\n\n`
-    : `📊 **Polls** (${polls.length})\n\n`) + lines.join("\n");
+  const summary = lang === "fa"
+    ? `📊 **نظرسنجی‌ها** (${polls.length})\n\n🟢 فعال: ${activePolls} · 👥 مجموع آرا: ${totalVotes}\n\n`
+    : `📊 **Polls** (${polls.length})\n\n🟢 Active: ${activePolls} · 👥 Total votes: ${totalVotes}\n\n`;
+
+  const txt = summary + lines.join("\n");
 
   if (msgId) await editRichMarkdown(cfg, chatId, msgId, txt, pollMenuKeyboard(lang));
   else await sendRichMarkdown(cfg, chatId, txt, pollMenuKeyboard(lang));
@@ -2723,7 +4516,8 @@ async function showPollStats(env, cfg, chatId, userId, msgId, lang) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * Show channel analytics: member count + delivery stats from scheduled posts.
+ * Show channel analytics: member count + delivery stats + growth tracking.
+ * Enhanced with time-range filtering and growth indicators.
  */
 async function showChannelStats(env, cfg, chatId, userId, msgId, lang) {
   const channels = await getChannels(env);
@@ -2739,12 +4533,33 @@ async function showChannelStats(env, cfg, chatId, userId, msgId, lang) {
 
   const scheduledPosts = await getScheduledPosts(env);
   const polls = await getPolls(env);
+  
+  // Load growth history from KV
+  const growthHistory = await getGrowthHistory(env);
 
   const lines = [];
+  let totalMembers = 0;
+  let totalGrowth = 0;
+
   for (const ch of channels) {
     // Member count (bot must be admin in the channel)
     const countRes = await tg(cfg, "getChatMemberCount", { chat_id: ch.id });
     const memberCount = countRes.ok ? countRes.result : "—";
+    
+    if (typeof memberCount === "number") totalMembers += memberCount;
+
+    // Calculate growth from history
+    const prevCount = growthHistory[ch.id]?.count || 0;
+    const growth = typeof memberCount === "number" && prevCount > 0
+      ? memberCount - prevCount
+      : 0;
+    const growthPercent = prevCount > 0
+      ? ((growth / prevCount) * 100).toFixed(1)
+      : "0.0";
+    totalGrowth += growth;
+    
+    const growthIcon = growth > 0 ? "📈" : growth < 0 ? "📉" : "➡️";
+    const growthText = growth > 0 ? `+${growth}` : String(growth);
 
     // Delivery stats for this channel
     const chPosts = scheduledPosts.filter(p => p.channelIds.some(c => String(c) === String(ch.id)));
@@ -2753,34 +4568,110 @@ async function showChannelStats(env, cfg, chatId, userId, msgId, lang) {
       (p.sendResults || []).filter(r => String(r.channelId) === String(ch.id) && !r.ok)
     );
     const successRate = sentPosts.length > 0
-      ? ((sentPosts.length - failedResults.length) / sentPosts.length * 100).toFixed(0) + "%"
+      ? ((sentPosts.length - failedResults.length) / sentPosts.length * 100).toFixed(0)
       : "—";
+    
+    // Visual progress bar for success rate
+    const progressBar = typeof successRate === "string" && successRate !== "—"
+      ? "█".repeat(Math.round(parseInt(successRate) / 10)) + "░".repeat(10 - Math.round(parseInt(successRate) / 10))
+      : "░░░░░░░░░░";
 
-    // Polls created in this channel (by chatId match)
-    // Note: polls are created in the bot DM, not channels. This counts all polls.
-    const pollCount = polls.length;
+    // Last post time
+    const lastPost = sentPosts.length > 0
+      ? new Date(Math.max(...sentPosts.map(p => new Date(p.sentAt || 0).getTime())))
+      : null;
+    const lastPostText = lastPost && lastPost.getTime() > 0
+      ? formatRelativeTime(lastPost, lang)
+      : (lang === "fa" ? "هرگز" : "Never");
 
     lines.push(
       `📡 **${ch.title}**\n` +
-      `   👥 Members: \`${memberCount}\`\n` +
-      `   📤 Scheduled: \`${chPosts.length}\` (sent: ${sentPosts.length})\n` +
-      `   ✅ Success rate: \`${successRate}\`\n`
+      `   👥 Members: \`${memberCount}\` ${growthIcon} ${growthText} (${growthPercent}%)\n` +
+      `   📤 Posts: \`${sentPosts.length}\`/${chPosts.length}\n` +
+      `   ✅ Success: \`${successRate}%\` ${progressBar}\n` +
+      `   🕐 Last: ${lastPostText}\n`
     );
   }
 
+  // Store current counts for next time
+  await saveGrowthHistory(env, channels, await Promise.all(
+    channels.map(async ch => {
+      const res = await tg(cfg, "getChatMemberCount", { chat_id: ch.id });
+      return res.ok ? res.result : 0;
+    })
+  ));
+
   // Overall summary
-  const totalMembers = lines.length;
   const totalScheduled = scheduledPosts.length;
   const totalSent = scheduledPosts.filter(p => p.sent).length;
+  const overallGrowthIcon = totalGrowth > 0 ? "📈" : totalGrowth < 0 ? "📉" : "➡️";
+  const overallGrowthText = totalGrowth > 0 ? `+${totalGrowth}` : String(totalGrowth);
 
   const summary = lang === "fa"
-    ? `📈 **آمار کانال‌ها**\n\n📅 مجموع: ${totalMembers} کانال · ${totalScheduled} زمان‌بندی · ${totalSent} ارسال‌شده · ${polls.length} نظرسنجی\n\n`
-    : `📈 **Channel Analytics**\n\n📅 Total: ${totalMembers} channels · ${totalScheduled} scheduled · ${totalSent} sent · ${polls.length} polls\n\n`;
+    ? `📈 **آمار کانال‌ها**\n\n📅 مجموع: ${channels.length} کانال · ${totalMembers} عضو ${overallGrowthIcon} ${overallGrowthText}\n📤 ${totalSent}/${totalScheduled} ارسال‌شده · ${polls.length} نظرسنجی\n\n`
+    : `📈 **Channel Analytics**\n\n📅 Total: ${channels.length} channels · ${totalMembers} members ${overallGrowthIcon} ${overallGrowthText}\n📤 ${totalSent}/${totalScheduled} sent · ${polls.length} polls\n\n`;
 
   const txt = summary + lines.join("\n");
 
   if (msgId) await editRichMarkdown(cfg, chatId, msgId, txt, backKeyboard(lang));
   else await sendRichMarkdown(cfg, chatId, txt, backKeyboard(lang));
+}
+
+/**
+ * Format a date as relative time (e.g., "2 hours ago", "3 days ago").
+ */
+function formatRelativeTime(date, lang) {
+  const now = Date.now();
+  const diff = now - date.getTime();
+  const minutes = Math.floor(diff / 60000);
+  const hours = Math.floor(diff / 3600000);
+  const days = Math.floor(diff / 86400000);
+
+  if (lang === "fa") {
+    if (minutes < 1) return "همین الان";
+    if (minutes < 60) return `${minutes} دقیقه پیش`;
+    if (hours < 24) return `${hours} ساعت پیش`;
+    return `${days} روز پیش`;
+  }
+  if (minutes < 1) return "Just now";
+  if (minutes < 60) return `${minutes}m ago`;
+  if (hours < 24) return `${hours}h ago`;
+  return `${days}d ago`;
+}
+
+/**
+ * Get growth history from KV.
+ */
+async function getGrowthHistory(env) {
+  try {
+    const val = await env.BOT_DB.get("growth_history", "json");
+    return val || {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Save current member counts to growth history.
+ */
+async function saveGrowthHistory(env, channels, counts) {
+  const history = await getGrowthHistory(env);
+  const now = Date.now();
+  
+  for (let i = 0; i < channels.length; i++) {
+    const ch = channels[i];
+    const count = counts[i];
+    if (count > 0) {
+      history[ch.id] = {
+        count,
+        updatedAt: now,
+      };
+    }
+  }
+  
+  try {
+    await env.BOT_DB.put("growth_history", JSON.stringify(history));
+  } catch {}
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2863,28 +4754,56 @@ async function handleInlineQuery(query, env, cfg) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const WELCOME = {
-  fa: `# 🤖 Rich Markdown Bot
+  fa: `# 🤖 Arefera Bot
 
-هر متن **Markdown** یا **HTML** بفرستید، به صورت Rich Message رندر میشه.
+**به ربات مدیریت محتوا خوش آمدید!**
 
-[Rich Markdown Telegram](https://core.telegram.org/bots/api#rich-message-formatting-options)
+🚀 امکانات:
+• 🤖 تولید محتوا با هوش مصنوعی
+• 📥 دانلود از یوتیوب، اینستاگرام و...
+• 📊 ساخت نظرسنجی و کوییز
+• 📈 آمار کانال با رهگیری رشد
 
-از دکمه‌های زیر برای دیدن راهنما و دمو استفاده کنید 👇`,
+یکی از گزینه‌ها را انتخاب کنید 👇`,
 
-  en: `# 🤖 Rich Markdown Bot
+  en: `# 🤖 Arefera Bot
 
-Send any **Markdown** or **HTML** text and it will be echoed back as a rendered Rich Message.
+**Welcome to Content Management Bot!**
 
-[Rich Markdown Telegram](https://core.telegram.org/bots/api#rich-message-formatting-options)
+🚀 Features:
+• 🤖 AI content generation
+• 📥 Download from YouTube, Instagram & more
+• 📊 Create polls and quizzes
+• 📈 Channel analytics with growth tracking
 
-Use the buttons below to explore 👇`,
+Choose an option below 👇`,
 };
 
 // ─── About ────────────────────────────────────────────────────────────────────
 const ABOUT = {
-  fa: `https://github.com/Arefmtl/arefera_admin_panel`,
+  fa: `# 🤖 Arefera Bot
 
-  en: `https://github.com/Arefmtl/arefera_admin_panel`,
+ربات مدیریت محتوای کانال تلگرام
+
+**امکانات:**
+• 🤖 تولید محتوا با AI
+• 📥 دانلود مدیا
+• 📊 نظرسنجی و کوییز
+• 📈 آمار کانال
+
+[GitHub](https://github.com/Arefmtl/arefera_admin_panel)`,
+
+  en: `# 🤖 Arefera Bot
+
+Telegram channel content management bot
+
+**Features:**
+• 🤖 AI content generation
+• 📥 Media downloader
+• 📊 Polls & quizzes
+• 📈 Channel analytics
+
+  [GitHub](https://github.com/Arefmtl/arefera_admin_panel)`,
 };
 
 // ─── Markdown Help ────────────────────────────────────────────────────────────
@@ -3966,7 +5885,8 @@ const AI_HELP = {
 — \`/ai <پرامپت>\` — تولید محتوا + پیش‌نمایش + دکمه‌های ارسال/زمان‌بندی
 — \`/askai\` — ورود به حالت چت چندنوبته با AI (حافظه مکالمه)
 — \`/scheduleai\` — تولید + انتخاب کانال + انتخاب زمان + ارسال خودکار
-— \`/scheduled\` — لیست زمان‌بندی‌های ثبت‌شده
+— \`/scheduled\` — لیست زمان‌بندی‌های ثبت‌شده با جزئیات
+— \`/cancel <id>\` — لغو زمان‌بندی
 — \`/aiconfig <provider> <apiKey>\` — تنظیم AI (ادمین)
 — \`/aimodel <model>\` — تغییر مدل (ادمین)
 — \`/aisystem <text>\` — تغییر system prompt (ادمین)
@@ -3985,8 +5905,12 @@ const AI_HELP = {
 2. همه: \`/ai یک پست جذاب درباره هوش مصنوعی بنویس\`
 3. روی دکمه‌ها کلیک کنید: ارسال فوری یا زمان‌بندی
 
-✨`,
+## نکات
 
+— حداکثر 4000 توکن در هر درخواست
+— پشتیبانی از streaming برای پاسخ‌های سریع‌تر
+— نمایش مصرف توکن بعد از تولید
+— تلاش مجدد خودکار در صورت خطا`,
 
   en: `# 🤖 AI Module
 
@@ -3997,7 +5921,8 @@ Generate content with AI, send to channels, or schedule for later.
 — \`/ai <prompt>\` — generate content + preview + send/schedule buttons
 — \`/askai\` — enter multi-turn AI chat mode (conversation memory)
 — \`/scheduleai\` — generate + pick channels + pick time + auto-send
-— \`/scheduled\` — list scheduled posts
+— \`/scheduled\` — list scheduled posts with details
+— \`/cancel <id>\` — cancel a scheduled post
 — \`/aiconfig <provider> <apiKey>\` — configure AI (admin)
 — \`/aimodel <model>\` — change model (admin)
 — \`/aisystem <text>\` — change system prompt (admin)
@@ -4016,7 +5941,12 @@ Generate content with AI, send to channels, or schedule for later.
 2. Anyone: \`/ai Write an engaging post about AI\`
 3. Click buttons: send now or schedule
 
-✨`,
+## Notes
+
+— Max 4000 tokens per request
+— Streaming support for faster responses
+— Token usage shown after generation
+— Auto-retry on errors`,
 };
 
 const AI_CONFIG_HELP = {
@@ -4064,8 +5994,8 @@ const TOOLS_HELP = {
 
 **پشتیبانی از:**
 — YouTube (ویدیو/صدا)
-— Spotify (metadata/preview)
 — TikTok · Instagram · Twitter/X
+— Facebook · Reddit · Pinterest
 — SoundCloud · Bandcamp
 — GitHub (فایل مستقیم)
 — و ده‌ها سایت دیگر
@@ -4075,6 +6005,19 @@ const TOOLS_HELP = {
 \`/dl https://github.com/user/repo/raw/main/file.py\`
 
 ⚠️ فایل‌های بزرگ‌تر از 45MB به صورت لینک ارسال می‌شوند.
+
+**پشتیبانی از RapidAPI:**
+\`RAPIDAPI_KEY\` را تنظیم کنید برای دانلود سریع‌تر و بدون محدودیت.
+
+## 📈 آمار کانال‌ها
+
+\`/stats\` — نمایش آمار زنده کانال‌ها
+
+**قابلیت‌ها:**
+— تعداد اعضا و رشد (+📈/📉)
+— نرخ موفقیت ارسال با نوار پیشرفت
+— زمان آخرین ارسال
+— ذخیره تاریخچه رشد در KV
 
 ## ⚡ دستورات اینلاین
 
@@ -4091,8 +6034,8 @@ Give a link, get the file.
 
 **Supports:**
 — YouTube (video/audio)
-— Spotify (metadata/preview)
 — TikTok · Instagram · Twitter/X
+— Facebook · Reddit · Pinterest
 — SoundCloud · Bandcamp
 — GitHub (direct files)
 — and dozens more sites
@@ -4102,6 +6045,19 @@ Give a link, get the file.
 \`/dl https://github.com/user/repo/raw/main/file.py\`
 
 ⚠️ Files larger than 45MB are sent as download links.
+
+**RapidAPI Support:**
+Set \`RAPIDAPI_KEY\` for faster, unlimited downloads.
+
+## 📈 Channel Analytics
+
+\`/stats\` — live channel statistics
+
+**Features:**
+— Member count and growth (+📈/📉)
+— Delivery success rate with progress bars
+— Last post time
+— Growth history stored in KV
 
 ## ⚡ Inline Commands
 
@@ -4143,7 +6099,18 @@ const DOWNLOAD_HELP = {
 
 ## خود-میزبان cobalt
 
-برای پایداری بیشتر، می‌توانید cobalt را خودتان میزبانی کنید و آدرس آن را در \`COBALT_API_URL\` تنظیم کنید.`,
+برای پایداری بیشتر، می‌توانید cobalt را خودتان میزبانی کنید و آدرس آن را در \`COBALT_API_URL\` تنظیم کنید.
+
+## RapidAPI
+
+برای دانلود سریع‌تر و بدون محدودیت، کلید RapidAPI خود را تنظیم کنید:
+\`RAPIDAPI_KEY=your_key\`
+
+سرویس‌های پشتیبانی شده:
+— YouTube: youtube-media-downloader1.p.rapidapi.com
+— TikTok: tiktok-downloader-api-tiktok.p.rapidapi.com
+— Instagram: instagram-downloader.p.rapidapi.com
+— Twitter: twitter-api45.p.rapidapi.com`,
 
   en: `# 📥 Media Downloader
 
@@ -4176,7 +6143,18 @@ Send a link, get the file.
 
 ## Self-host cobalt
 
-For better reliability, you can self-host cobalt and set its URL in \`COBALT_API_URL\`.`,
+For better reliability, you can self-host cobalt and set its URL in \`COBALT_API_URL\`.
+
+## RapidAPI
+
+For faster, unlimited downloads, set your RapidAPI key:
+\`RAPIDAPI_KEY=your_key\`
+
+Supported services:
+— YouTube: youtube-media-downloader1.p.rapidapi.com
+— TikTok: tiktok-downloader-api-tiktok.p.rapidapi.com
+— Instagram: instagram-downloader.p.rapidapi.com
+— Twitter: twitter-api45.p.rapidapi.com`,
 };
 
 const POLL_HELP = {
@@ -4193,23 +6171,45 @@ const POLL_HELP = {
 /poll بهترین زبان برنامه‌نویسی؟ | Python | JavaScript | Rust | Go
 \`\`\`
 
+## نظرسنجی غیرناشناس
+
+برای نمایش رأی‌دهندگان:
+\`\`\`
+/poll! سوال؟ | گزینه ۱ | گزینه ۲
+\`\`\`
+
+## محدودیت زمانی
+
+اضافه کردن \`:<زمان>\` در انتهای گزینه‌ها:
+\`\`\`
+/poll سوال؟ | گزینه۱ | گزینه۲ | :30m
+/poll سوال؟ | گزینه۱ | گزینه۲ | :2h
+\`\`\`
+
 ## ساخت کوییز (با جواب درست)
 
 علامت \`!\` قبل از گزینه درست:
-
 \`\`\`
 /quiz پایتخت فرانسه؟ | لندن | !پاریس | برلین
 \`\`\`
 
 ## مشاهده نتایج
 
-\`/pollstats\` — لیست همه نظرسنجی‌ها با درصد آرا و نمودار میله‌ای
+\`/pollstats\` — لیست همه نظرسنجی‌ها با:
+— درصد آرا و نمودار میله‌ای
+— وضعیت فعال/غیرفعال (🟢/🔴)
+— اطلاعات رأی‌دهندگان (برای نظرسنجی غیرناشناس)
+— زمان باقیمانده (برای نظرسنجی با محدودیت زمانی)
+
+## لغو زمان‌بندی
+
+\`/cancel <id>\` — لغو پست زمان‌بندی شده
 
 ## نکات
 
-— نظرسنجی‌ها غیرناشناس هستند (برای رهگیری آراء)
 — تا 10 گزینه قابل قبول
-— نتایج به‌صورت زنده در \`/pollstats\` نمایش داده می‌شوند`,
+— نتایج به‌صورت زنده در \`/pollstats\` نمایش داده می‌شوند
+— نظرسنجی‌های منقضی شده با 🔴 نشان داده می‌شوند`,
 
   en: `# 📊 Polls & Quizzes
 
@@ -4224,21 +6224,43 @@ Example:
 /poll Best programming language? | Python | JavaScript | Rust | Go
 \`\`\`
 
+## Non-Anonymous Poll
+
+To show voters:
+\`\`\`
+/poll! Question? | Option 1 | Option 2
+\`\`\`
+
+## Time Limit
+
+Add \`:<time>\` at the end of options:
+\`\`\`
+/poll Q? | Opt1 | Opt2 | :30m
+/poll Q? | Opt1 | Opt2 | :2h
+\`\`\`
+
 ## Create a Quiz (with correct answer)
 
 Mark the correct option with \`!\`:
-
 \`\`\`
 /quiz Capital of France? | London | !Paris | Berlin
 \`\`\`
 
 ## View Results
 
-\`/pollstats\` — list all polls with vote percentages and bar charts
+\`/pollstats\` — list all polls with:
+— Vote percentages and bar charts
+— Active/inactive status (🟢/🔴)
+— Voter information (for non-anonymous polls)
+— Time remaining (for time-limited polls)
+
+## Cancel Scheduled
+
+\`/cancel <id>\` — cancel a scheduled post
 
 ## Notes
 
-— Polls are non-anonymous (for vote tracking)
 — Up to 10 options
-— Results update live in \`/pollstats\``,
+— Results update live in \`/pollstats\`
+— Expired polls shown with 🔴`,
 };
