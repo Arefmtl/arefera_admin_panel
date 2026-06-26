@@ -47,11 +47,6 @@
  *    • /stats                 → member count per channel + scheduled-post
  *                                delivery success rate + poll participation
  *
- *    WEB APP MENU (🌐)
- *    • If WEB_APP_URL env is set, the bot sets a Telegram Menu Button (bottom
- *      left of chat) that opens the Next.js admin panel as a Telegram Web App.
- *    • /webapp command also sends an inline button to open the panel.
- *
  *    INLINE QUERIES (⚡)
  *    • @bot <url>             → returns a "Download" article (sends /dl)
  *    • @bot ai <prompt>       → returns AI-generated article (short response)
@@ -70,7 +65,6 @@
  *      env.BOT_TOKEN        → Telegram bot token          (default: hardcoded)
  *      env.OWNER_ID         → numeric Telegram user id    (default: hardcoded)
  *      env.WEBHOOK_SECRET   → optional webhook secret     (default: "")
- *      env.WEB_APP_URL      → HTTPS URL of the web panel  (default: "")
  *      env.AI_PROVIDER      → "openai"|"groq"|"together"|"openrouter"|"custom"
  *      env.AI_API_KEY       → API key for the AI provider (default: "")
  *      env.AI_BASE_URL      → override base URL           (default: by provider)
@@ -246,7 +240,6 @@ function getConfig(env) {
   const token = (env && env.BOT_TOKEN && String(env.BOT_TOKEN).trim()) || DEFAULT_BOT_TOKEN;
   const owner = Number(env && env.OWNER_ID) || DEFAULT_OWNER_ID;
   const secret = (env && env.WEBHOOK_SECRET && String(env.WEBHOOK_SECRET).trim()) || "";
-  const webAppUrl = (env && env.WEB_APP_URL && String(env.WEB_APP_URL).trim()) || "";
   const cobaltUrl = (env && env.COBALT_API_URL && String(env.COBALT_API_URL).trim()) || "https://api.cobalt.tools";
 
   // RapidAPI config — generic key + optional per-platform overrides
@@ -272,7 +265,6 @@ function getConfig(env) {
     botToken: token,
     ownerId: owner,
     webhookSecret: secret,
-    webAppUrl,
     cobaltUrl,
     rapidApiKey,
     rapidApiYoutubeKey,
@@ -426,14 +418,14 @@ async function botInfo(cfg) {
 async function setupBotCommands(cfg) {
   const commands = [
     { command: "start", description: "🚀 شروع / Start" },
+    { command: "newpost", description: "📝 ساخت پست" },
     { command: "ai", description: "🤖 تولید محتوا با AI" },
     { command: "askai", description: "💬 چت با AI" },
     { command: "dl", description: "📥 دانلود مدیا" },
     { command: "poll", description: "📊 ساخت نظرسنجی" },
     { command: "quiz", description: "🎯 ساخت کوییز" },
+    { command: "scheduled", description: "📋 لیست زمان‌بندی‌ها" },
     { command: "stats", description: "📈 آمار کانال" },
-    { command: "schedule", description: "⏰ زمان‌بندی پست" },
-    { command: "webapp", description: "🌐 پنل وب" },
     { command: "cancel", description: "❌ لغو عملیات" },
   ];
   return await tg(cfg, "setMyCommands", { commands });
@@ -765,7 +757,6 @@ function mainKeyboard(lang, admin, cfg) {
     }
     rows.push([
       { text: "📖 راهنما", callback_data: "fa_help_md" },
-      { text: "🌐 پنل وب", web_app: { url: cfg?.webAppUrl || "https://example.com" } },
     ]);
     rows.push([{ text: "🇬🇧 English", callback_data: "en_start" }]);
     return { inline_keyboard: rows };
@@ -790,7 +781,6 @@ function mainKeyboard(lang, admin, cfg) {
   }
   rows.push([
     { text: "📖 Help", callback_data: "en_help_md" },
-    { text: "🌐 Web Panel", web_app: { url: cfg?.webAppUrl || "https://example.com" } },
   ]);
   rows.push([{ text: "🇮🇷 فارسی", callback_data: "fa_start" }]);
   return { inline_keyboard: rows };
@@ -1147,6 +1137,26 @@ function standalonePollChannelSelect(lang, channels, selected) {
   return { inline_keyboard: rows };
 }
 
+// ─── AI channel select keyboard ──────────────────────────────────────────────
+function aiChannelSelectKeyboard(lang, channels, selected, mode) {
+  const rows = channels.map(ch => {
+    const checked = selected.includes(String(ch.id)) ? "✅ " : "▫️ ";
+    return [{ text: `${checked}${ch.title}`, callback_data: `${lang}_ai_${mode}_ch_${ch.id}` }];
+  });
+  if (lang === "fa") {
+    rows.push([
+      { text: "📤 ارسال", callback_data: `fa_ai_${mode}_confirm` },
+    ]);
+    rows.push([{ text: "⬅️ بازگشت", callback_data: "fa_ai_menu" }]);
+  } else {
+    rows.push([
+      { text: "📤 Send", callback_data: `en_ai_${mode}_confirm` },
+    ]);
+    rows.push([{ text: "⬅️ Back", callback_data: "en_ai_menu" }]);
+  }
+  return { inline_keyboard: rows };
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Message handler
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1156,17 +1166,9 @@ async function handleMessage(message, env, cfg) {
   const rawText = message.text || "";
   const trimmed = rawText.trim();
 
-  // ── /start — also set the Web App menu button if configured ──────────────
+  // ── /start — show language selection ──────────────────────────────────────
   if (trimmed === "/start" || trimmed === "/help") {
     await sendPlain(cfg, chatId, LANG_SELECT_MESSAGE, LANG_SELECT_KEYBOARD);
-    if (cfg.webAppUrl) {
-      // Best-effort: set the menu button for this user. Ignore errors (e.g.
-      // the bot can't set menu buttons for users who haven't started it).
-      await tg(cfg, "setChatMenuButton", {
-        chat_id: chatId,
-        menu_button: { type: "web_app", text: "🌐 Panel", web_app: { url: cfg.webAppUrl } },
-      }).catch(() => {});
-    }
     return;
   }
 
@@ -1178,24 +1180,20 @@ async function handleMessage(message, env, cfg) {
   const argText = cmd ? trimmed.slice(cmdMatch[0].length).trim() : "";
 
   // /cancel — always works, clears any state
-  if (cmd === "cancel") {
+  if (cmd === "cancel" && !argText) {
     await setState(env, userId, null);
     await sendPlain(cfg, chatId, langFa(cfg, userId) ? "❌ عملیات لغو شد." : "❌ Operation cancelled.");
     return;
   }
 
-  // /webapp — open web panel
-  if (cmd === "webapp" || cmd === "panel") {
-    if (cfg.webAppUrl) {
-      await sendPlain(cfg, chatId,
-        langFa(cfg, userId) ? "🌐 پنل ادمین وب:" : "🌐 Web admin panel:",
-        { inline_keyboard: [[{ text: langFa(cfg, userId) ? "🌐 باز کردن پنل" : "🌐 Open Panel", web_app: { url: cfg.webAppUrl } }]] }
-      );
-    } else {
-      await sendPlain(cfg, chatId, langFa(cfg, userId)
-        ? "⚠️ پنل وب تنظیم نشده. WEB_APP_URL را در تنظیمات Worker قرار دهید."
-        : "⚠️ Web panel not configured. Set WEB_APP_URL in the Worker settings.");
-    }
+  // /newpost — start post creation
+  if (cmd === "newpost") {
+    const lang = langFa(cfg, userId) ? "fa" : "en";
+    await setState(env, userId, { action: "post_await_text", lang });
+    const txt = langFa(cfg, userId)
+      ? "📝 **ساخت پست**\n\nمتن پست خود را ارسال کنید (Markdown یا HTML پشتیبانی می‌شود).\n\nبرای لغو /cancel را ارسال کنید."
+      : "📝 **New Post**\n\nSend the text of your post (Markdown or HTML supported).\n\nSend /cancel to abort.";
+    await sendPlain(cfg, chatId, txt);
     return;
   }
 
@@ -1333,29 +1331,54 @@ async function handleMessage(message, env, cfg) {
     if (handled) return;
   }
 
-  // ── Rich echo (the original bot behaviour) ───────────────────────────────
-  // Telegram clients auto-format `**bold**`, ```code```, etc. typed by the user
-  // into formatting entities and STRIP the raw markdown syntax from message.text.
-  // Reconstruct the original Markdown/HTML from text + entities before echoing.
+  // ── Rich echo with poll/quiz auto-detection ──────────────────────────────
   let text = entitiesToMarkdown(rawText, message.entities).trim();
   if (!text) text = trimmed;
 
-  if (!text) return; // empty message (e.g. sticker with no caption)
+  if (!text) return;
 
-  if (text.startsWith("<") || /<\/?\w/.test(text)) {
-    await sendRichHtml(cfg, chatId, text);
-  } else {
-    await sendRichMarkdown(cfg, chatId, text);
+  const { cleanText, polls } = parseEmbeddedPolls(text);
+
+  if (cleanText.trim()) {
+    if (cleanText.startsWith("<") || /<\/?\w/.test(cleanText)) {
+      await sendRichHtml(cfg, chatId, cleanText);
+    } else {
+      await sendRichMarkdown(cfg, chatId, cleanText);
+    }
+  }
+
+  if (polls.length > 0) {
+    for (const poll of polls) {
+      const body = {
+        chat_id: chatId,
+        question: poll.question,
+        options: poll.options.map(opt => ({ text: opt })),
+        is_anonymous: true,
+        type: poll.type === "quiz" ? "quiz" : "regular",
+      };
+      if (poll.type === "quiz" && poll.correctOptionId !== undefined) {
+        body.correct_option_id = poll.correctOptionId;
+      }
+      await callApi(cfg, "sendPoll", body);
+    }
   }
 }
 
 // ─── Helper: detect user language from existing state or default to FA ────────
-// Used by slash commands that need a language before any state is set.
 function langFa(cfg, userId) {
-  // Default to FA (the bot's primary audience). Could be improved by storing
-  // per-user language preference in KV, but for now FA is the safe default
-  // since the original bot was FA-first.
+  // Check if user has set language via /start keyboard
+  // Default to FA for backward compatibility
   return true;
+}
+
+// ─── Get language from state ─────────────────────────────────────────────────
+async function getUserLang(env, userId) {
+  try {
+    const state = await getState(env, userId);
+    return state?.lang || "fa";
+  } catch {
+    return "fa";
+  }
 }
 
 // ─── Managing text inputs in different modes (add admin, channel, create post) ──
@@ -1363,6 +1386,15 @@ async function handleStateInput(env, message, state, cfg) {
   const chatId  = message.chat.id;
   const userId  = message.from?.id;
   const rawText = message.text;
+  
+  // Guard against non-text messages (stickers, photos, voice, etc.)
+  if (!rawText) {
+    await sendPlain(cfg, chatId, state.lang === "fa"
+      ? "⚠️ لطفاً متن ارسال کنید."
+      : "⚠️ Please send text.");
+    return true;
+  }
+  
   const trimmed = rawText.trim();
   const lang    = state.lang || "fa";
 
@@ -2313,130 +2345,8 @@ async function handleCallback(cb, env, cfg) {
     return;
   }
 
-  if (action.startsWith("cal_day_")) {
-    const parts = action.split("_");
-    const year = parseInt(parts[2]);
-    const month = parseInt(parts[3]);
-    const day = parseInt(parts[4]);
-    const selectedDate = new Date(year, month, day);
-    
-    const state = await getState(env, userId);
-    if (!state) return;
-    
-    // Store selected date and show time picker
-    await setState(env, userId, { ...state, action: "schedule_await_time", selectedDate: selectedDate.toISOString() });
-    
-    const dateStr = selectedDate.toLocaleDateString(lang === "fa" ? "fa-IR" : "en-US", { weekday: "long", year: "numeric", month: "long", day: "numeric" });
-    await editRichMarkdown(cfg, chatId, msgId,
-      lang === "fa"
-        ? `📅 **${dateStr}** انتخاب شد!\n\n⏰ ساعت را انتخاب کنید:`
-        : `📅 **${dateStr}** selected!\n\n⏰ Pick a time:`,
-      timePickerKeyboard(lang));
-    return;
-  }
-
   // ── Time picker handlers ──────────────────────────────────────────────
-  if (action.startsWith("time_quick_")) {
-    const state = await getState(env, userId);
-    if (!state) return;
-    
-    let sendAt;
-    const now = Date.now();
-    
-    if (action === "time_quick_1h") sendAt = now + 3600000;
-    else if (action === "time_quick_2h") sendAt = now + 7200000;
-    else if (action === "time_quick_3h") sendAt = now + 10800000;
-    else if (action === "time_quick_6h") sendAt = now + 21600000;
-    else if (action === "time_quick_tomorrow_9") {
-      const tomorrow = new Date();
-      tomorrow.setDate(tomorrow.getDate() + 1);
-      tomorrow.setHours(9, 0, 0, 0);
-      sendAt = tomorrow.getTime();
-    }
-    else if (action === "time_quick_tomorrow_21") {
-      const tomorrow = new Date();
-      tomorrow.setDate(tomorrow.getDate() + 1);
-      tomorrow.setHours(21, 0, 0, 0);
-      sendAt = tomorrow.getTime();
-    }
-    
-    if (sendAt && state.selectedChannels) {
-      // Schedule the post
-      const post = {
-        id: `post_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-        userId,
-        generatedText: state.text,
-        channelIds: state.selectedChannels,
-        sendAt,
-        sent: false,
-        postState: {
-          text: state.text,
-          buttons: state.buttons,
-          polls: state.polls,
-        },
-      };
-      await addScheduledPost(env, post);
-      await setState(env, userId, null);
-      
-      const dateStr = new Date(sendAt).toLocaleString(lang === "fa" ? "fa-IR" : "en-US");
-      await editRichMarkdown(cfg, chatId, msgId,
-        lang === "fa"
-          ? `✅ **زمان‌بندی شد!**\n\n📅 زمان ارسال: \`${dateStr}\`\n📡 کانال‌ها: ${state.selectedChannels.length}\n🆔 شناسه: \`${post.id}\``
-          : `✅ **Scheduled!**\n\n📅 Send at: \`${dateStr}\`\n📡 Channels: ${state.selectedChannels.length}\n🆔 ID: \`${post.id}\``,
-        mainKeyboard(lang, admin, cfgWithAi));
-    }
-    return;
-  }
-
-  if (action.startsWith("time_")) {
-    const state = await getState(env, userId);
-    if (!state) return;
-    
-    const parts = action.split("_");
-    const hour = parseInt(parts[1]);
-    const minute = parseInt(parts[2] || 0);
-    
-    let sendAt;
-    if (state.selectedDate) {
-      const date = new Date(state.selectedDate);
-      date.setHours(hour, minute, 0, 0);
-      sendAt = date.getTime();
-    } else {
-      const now = new Date();
-      now.setHours(hour, minute, 0, 0);
-      sendAt = now.getTime();
-      if (sendAt < Date.now()) sendAt += 86400000; // Tomorrow if time passed
-    }
-    
-    if (state.selectedChannels) {
-      const post = {
-        id: `post_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-        userId,
-        generatedText: state.text,
-        channelIds: state.selectedChannels,
-        sendAt,
-        sent: false,
-        postState: {
-          text: state.text,
-          buttons: state.buttons,
-          polls: state.polls,
-        },
-      };
-      await addScheduledPost(env, post);
-      await setState(env, userId, null);
-      
-      const dateStr = new Date(sendAt).toLocaleString(lang === "fa" ? "fa-IR" : "en-US");
-      await editRichMarkdown(cfg, chatId, msgId,
-        lang === "fa"
-          ? `✅ **زمان‌بندی شد!**\n\n📅 زمان ارسال: \`${dateStr}\`\n📡 کانال‌ها: ${state.selectedChannels.length}\n🆔 شناسه: \`${post.id}\``
-          : `✅ **Scheduled!**\n\n📅 Send at: \`${dateStr}\`\n📡 Channels: ${state.selectedChannels.length}\n🆔 ID: \`${post.id}\``,
-        mainKeyboard(lang, admin, cfgWithAi));
-    }
-    return;
-  }
-
-  // ── AI menu ──────────────────────────────────────────────────────────────
-  if (action === "ai_menu") {
+  if (action === "time_back_cal") {
     await editRichMarkdown(cfg, chatId, msgId, AI_HELP[lang], aiMenuKeyboard(lang, cfgWithAi));
     return;
   }
@@ -2462,6 +2372,13 @@ async function handleCallback(cb, env, cfg) {
       cancelKeyboard(lang));
     return;
   }
+  if (action === "ai_cancel") {
+    await setState(env, userId, null);
+    await editRichMarkdown(cfg, chatId, msgId, lang === "fa"
+      ? "❌ عملیات لغو شد."
+      : "❌ Operation cancelled.", main);
+    return;
+  }
   if (action === "ai_scheduled_list") {
     await showScheduledList(env, cfg, chatId, userId, msgId, lang);
     return;
@@ -2474,7 +2391,7 @@ async function handleCallback(cb, env, cfg) {
     await editRichMarkdown(cfg, chatId, msgId, AI_CONFIG_HELP[lang], aiConfigMenuKeyboard(lang));
     return;
   }
-  if (action === "ai_config_set") {
+  if (action === "aiconfig_change") {
     await setState(env, userId, { action: "ai_config_await", lang });
     await editRichMarkdown(cfg, chatId, msgId, lang === "fa"
       ? "🔑 **تنظیم Provider + API Key**\n\nبه این فرمت بفرستید:\n`openai sk-xxxxx`\n\nProviders: `openai` · `groq` · `together` · `openrouter` · `custom`\n\nبرای custom باید baseUrl هم بدید:\n`custom sk-xxx https://my-api.com/v1`\n\nبرای لغو /cancel"
@@ -2482,7 +2399,7 @@ async function handleCallback(cb, env, cfg) {
       cancelKeyboard(lang));
     return;
   }
-  if (action === "ai_model_set") {
+  if (action === "aimodel_change") {
     await setState(env, userId, { action: "ai_model_await", lang });
     await editRichMarkdown(cfg, chatId, msgId, lang === "fa"
       ? "🤖 مدل جدید را بفرستید. مثال: `gpt-4o`\n\nبرای لغو /cancel"
@@ -2490,7 +2407,7 @@ async function handleCallback(cb, env, cfg) {
       cancelKeyboard(lang));
     return;
   }
-  if (action === "ai_system_set") {
+  if (action === "aisystem_change") {
     await setState(env, userId, { action: "ai_system_await", lang });
     await editRichMarkdown(cfg, chatId, msgId, lang === "fa"
       ? "📝 System prompt جدید را بفرستید.\n\nبرای لغو /cancel"
@@ -2523,7 +2440,7 @@ async function handleCallback(cb, env, cfg) {
       aiChannelSelectKeyboard(lang, channels, [], "send_now"));
     return;
   }
-  if (action === "ai_schedule_this") {
+  if (action === "ai_schedule_now") {
     const state = await getState(env, userId);
     if (!state || state.action !== "ai_preview") return;
     const channels = await getChannels(env);
@@ -2663,7 +2580,7 @@ async function handleCallback(cb, env, cfg) {
     await editRichMarkdown(cfg, chatId, msgId, POLL_HELP[lang], pollMenuKeyboard(lang));
     return;
   }
-  if (action === "poll_list") {
+  if (action === "pollstats") {
     await showPollStats(env, cfg, chatId, userId, msgId, lang);
     return;
   }
@@ -3285,6 +3202,50 @@ async function sendPlain(cfg, chatId, text, replyMarkup) {
   await callApi(cfg, "sendMessage", body);
 }
 
+async function sendPlainResult(cfg, chatId, text, replyMarkup) {
+  const body = { chat_id: chatId, text };
+  if (replyMarkup) body.reply_markup = replyMarkup;
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${cfg.botToken}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    return await res.json();
+  } catch (err) {
+    return { ok: false, description: String(err) };
+  }
+}
+
+async function sendScheduledMessage(cfg, chatId, text, isHtml, replyMarkup) {
+  const body = { chat_id: chatId };
+  if (isHtml) {
+    body.rich_message = { html: text };
+  } else {
+    body.rich_message = { markdown: text };
+  }
+  if (replyMarkup) body.reply_markup = replyMarkup;
+
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${cfg.botToken}/sendRichMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const json = await res.json();
+
+    if (!json.ok) {
+      console.log(`[Scheduler] Rich message failed (${json.description}), falling back to plain text`);
+      return await sendPlainResult(cfg, chatId, text, replyMarkup);
+    }
+
+    return json;
+  } catch (err) {
+    console.log(`[Scheduler] Rich message error (${err}), falling back to plain text`);
+    return await sendPlainResult(cfg, chatId, text, replyMarkup);
+  }
+}
+
 async function sendRichMarkdown(cfg, chatId, markdown, replyMarkup) {
   const body = { chat_id: chatId, rich_message: { markdown } };
   if (replyMarkup) body.reply_markup = replyMarkup;
@@ -3672,11 +3633,9 @@ async function runScheduledPosts(env, cfg, viaHttp) {
         // Send text post if there's text content
         let textOk = true;
         if (text) {
-          const isHtml = text.startsWith("<") || /<\/?\w/.test(text);
           const replyMarkup = postState.buttons ? { inline_keyboard: postState.buttons } : undefined;
-          const res = isHtml
-            ? await sendRichHtmlResult(cfg, chId, text, replyMarkup)
-            : await sendRichMarkdownResult(cfg, chId, text, replyMarkup);
+          const isHtml = !!postState.isHtml;
+          const res = await sendScheduledMessage(cfg, chId, text, isHtml, replyMarkup);
           textOk = !!res?.ok;
           
           if (!textOk) {
@@ -3690,37 +3649,40 @@ async function runScheduledPosts(env, cfg, viaHttp) {
           }
         }
 
-        // Send poll if exists
+        // Send polls if exist (array of polls)
         let pollOk = false;
-        if (postState.poll) {
-          const poll = postState.poll;
-          const pollBody = {
-            chat_id: chId,
-            question: poll.question,
-            options: poll.options,
-            is_anonymous: poll.anonymous !== false,
-          };
-          if (poll.type === "quiz") {
-            pollBody.type = "quiz";
-            pollBody.correct_option_id = poll.correctOptionId;
-          }
-          const pollRes = await tg(cfg, "sendPoll", pollBody);
-          pollOk = !!pollRes?.ok;
-
-          if (pollOk) {
-            const pollRecord = {
-              id: `poll_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-              pollId: pollRes.result.poll.id,
+        const polls = postState.polls || (postState.poll ? [postState.poll] : []);
+        for (const poll of polls) {
+          try {
+            const pollBody = {
+              chat_id: chId,
               question: poll.question,
               options: poll.options,
-              chatId: chId,
-              messageId: pollRes.result.message_id,
-              type: poll.type,
-              anonymous: poll.anonymous !== false,
-              correctOptionId: poll.correctOptionId,
-              createdAt: Date.now(),
+              is_anonymous: poll.anonymous !== false,
             };
-            await addPoll(env, pollRecord);
+            if (poll.type === "quiz") {
+              pollBody.type = "quiz";
+              pollBody.correct_option_id = poll.correctOptionId;
+            }
+            const pollRes = await tg(cfg, "sendPoll", pollBody);
+            if (pollRes?.ok) {
+              pollOk = true;
+              const pollRecord = {
+                id: `poll_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+                pollId: pollRes.result.poll.id,
+                question: poll.question,
+                options: poll.options,
+                chatId: chId,
+                messageId: pollRes.result.message_id,
+                type: poll.type,
+                anonymous: poll.anonymous !== false,
+                correctOptionId: poll.correctOptionId,
+                createdAt: Date.now(),
+              };
+              await addPoll(env, pollRecord);
+            }
+          } catch (err) {
+            console.error(`Poll send error: ${err}`);
           }
         }
 
@@ -3787,41 +3749,61 @@ async function handleScheduledList(env, cfg, chatId, userId, msgId, lang) {
   
   if (posts.length === 0) {
     const txt = lang === "fa"
-      ? "📋 هیچ زمان‌بندی ثبت نشده.\n\nبرای ثبت: /scheduleai"
-      : "📋 No scheduled posts.\n\nTo schedule: /scheduleai";
+      ? "📋 **زمان‌بندی‌ها**\n\nهیچ پست زمان‌بندی شده‌ای نیست.\n\n💡 برای زمان‌بندی پست از /newpost استفاده کنید."
+      : "📋 **Scheduled Posts**\n\nNo scheduled posts yet.\n\n💡 Use /newpost to schedule a post.";
     if (msgId) await editRichMarkdown(cfg, chatId, msgId, txt, backKeyboard(lang));
     else await sendPlain(cfg, chatId, txt);
     return;
   }
 
-  const lines = [];
   const pending = posts.filter(p => !p.sent);
   const sent = posts.filter(p => p.sent && !p.failed);
   const failed = posts.filter(p => p.failed);
 
+  let txt = lang === "fa"
+    ? `📋 **زمان‌بندی‌ها**\n\n⏳ ${pending.length} در انتظار · ✅ ${sent.length} ارسال‌شده · ❌ ${failed.length} ناموفق\n\n`
+    : `📋 **Scheduled Posts**\n\n⏳ ${pending.length} pending · ✅ ${sent.length} sent · ❌ ${failed.length} failed\n\n`;
+
+  // Pending posts
   if (pending.length > 0) {
-    lines.push(lang === "fa" ? "⏳ **در انتظار ارسال:**\n" : "⏳ **Pending:**\n");
-    for (const post of pending.slice(-5)) {
-      const dateStr = new Date(post.sendAt).toLocaleString(lang === "fa" ? "fa-IR" : "en-US");
+    txt += lang === "fa" ? "⏳ **در انتظار ارسال:**\n\n" : "⏳ **Pending:**\n\n";
+    for (const post of pending.slice(-10)) {
+      // Convert to Iran time (UTC+3:30)
+      const sendDate = new Date(post.sendAt + TIMEZONE_OFFSET_MS);
+      const dateStr = sendDate.toISOString().slice(0, 10);
+      const timeStr = sendDate.toISOString().slice(11, 16);
       const channels = post.channelIds.length;
-      lines.push(`   📌 \`${post.id}\`\n      📅 ${dateStr}\n      📡 ${channels} ${lang === "fa" ? "کانال" : "channels"}\n`);
+      const textPreview = (post.generatedText || post.postState?.text || "").slice(0, 40);
+      const hasPolls = (post.postState?.polls || []).length > 0;
+      const hasButtons = (post.postState?.buttons || []).length > 0;
+      
+      let tags = [];
+      if (hasPolls) tags.push("📊");
+      if (hasButtons) tags.push("🔘");
+      const tagStr = tags.length > 0 ? " " + tags.join("") : "";
+      
+      txt += `📌 **${dateStr} — ${timeStr}** (IR)${tagStr}\n`;
+      txt += `   📡 ${channels} ${lang === "fa" ? "کانال" : "channels"}\n`;
+      if (textPreview) txt += `   💬 ${textPreview}...\n`;
+      txt += `   🆔 \`${post.id}\`\n\n`;
     }
   }
 
+  // Failed posts
   if (failed.length > 0) {
-    lines.push(lang === "fa" ? "\n❌ **ناموفق:**\n" : "\n❌ **Failed:**\n");
+    txt += lang === "fa" ? "\n❌ **ناموفق:**\n\n" : "\n❌ **Failed:**\n\n";
     for (const post of failed.slice(-3)) {
-      const dateStr = new Date(post.sentAt || post.sendAt).toLocaleString(lang === "fa" ? "fa-IR" : "en-US");
+      // Convert to Iran time (UTC+3:30)
+      const sendDate = new Date((post.sentAt || post.sendAt) + TIMEZONE_OFFSET_MS);
+      const dateStr = sendDate.toISOString().slice(0, 10);
+      const timeStr = sendDate.toISOString().slice(11, 16);
       const errors = (post.sendResults || []).filter(r => !r.ok).map(r => r.error).join(", ");
-      lines.push(`   📌 \`${post.id}\`\n      📅 ${dateStr}\n      ⚠️ ${errors.slice(0, 50)}\n`);
+      
+      txt += `❌ **${dateStr} ${timeStr}** (IR)\n`;
+      txt += `   ⚠️ ${errors.slice(0, 60)}\n`;
+      txt += `   🆔 \`${post.id}\`\n\n`;
     }
   }
-
-  const summary = lang === "fa"
-    ? `📋 **زمان‌بندی‌ها** (${posts.length})\n\n⏳ ${pending.length} در انتظار · ✅ ${sent.length} ارسال‌شده · ❌ ${failed.length} ناموفق\n\n`
-    : `📋 **Scheduled Posts** (${posts.length})\n\n⏳ ${pending.length} pending · ✅ ${sent.length} sent · ❌ ${failed.length} failed\n\n`;
-
-  const txt = summary + lines.join("\n");
 
   if (msgId) await editRichMarkdown(cfg, chatId, msgId, txt, backKeyboard(lang));
   else await sendRichMarkdown(cfg, chatId, txt, backKeyboard(lang));
@@ -4708,7 +4690,6 @@ async function handleInlineQuery(query, env, cfg) {
     results.push(article("cmd_dl", "📥 Download", "Download media from URL", "/dl ", "Markdown"));
     results.push(article("cmd_poll", "📊 Poll", "Create a poll", "/poll Question? | Opt1 | Opt2", "Markdown"));
     results.push(article("cmd_stats", "📈 Stats", "Channel analytics", "/stats", "Markdown"));
-    results.push(article("cmd_webapp", "🌐 Web Panel", "Open web admin panel", "/webapp", "Markdown"));
   } else if (q.toLowerCase().startsWith("ai ")) {
     // AI generation inline (best-effort, short response)
     const prompt = q.slice(3).trim();
