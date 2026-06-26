@@ -1,4 +1,4 @@
-﻿/**
+/**
  * ═══════════════════════════════════════════════════════════════════════════════
  *  Telegram Rich Markdown Bot — Cloudflare Worker (v2 — Full Edition)
  *  Bot API 10.1 (Rich Message support) + AI + Media Downloader + Polls + Analytics
@@ -1147,6 +1147,26 @@ function standalonePollChannelSelect(lang, channels, selected) {
   return { inline_keyboard: rows };
 }
 
+// ─── AI channel select keyboard ──────────────────────────────────────────────
+function aiChannelSelectKeyboard(lang, channels, selected, mode) {
+  const rows = channels.map(ch => {
+    const checked = selected.includes(String(ch.id)) ? "✅ " : "▫️ ";
+    return [{ text: `${checked}${ch.title}`, callback_data: `${lang}_ai_${mode}_ch_${ch.id}` }];
+  });
+  if (lang === "fa") {
+    rows.push([
+      { text: "📤 ارسال", callback_data: `fa_ai_${mode}_confirm` },
+    ]);
+    rows.push([{ text: "⬅️ بازگشت", callback_data: "fa_ai_menu" }]);
+  } else {
+    rows.push([
+      { text: "📤 Send", callback_data: `en_ai_${mode}_confirm` },
+    ]);
+    rows.push([{ text: "⬅️ Back", callback_data: "en_ai_menu" }]);
+  }
+  return { inline_keyboard: rows };
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Message handler
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1178,24 +1198,20 @@ async function handleMessage(message, env, cfg) {
   const argText = cmd ? trimmed.slice(cmdMatch[0].length).trim() : "";
 
   // /cancel — always works, clears any state
-  if (cmd === "cancel") {
+  if (cmd === "cancel" && !argText) {
     await setState(env, userId, null);
     await sendPlain(cfg, chatId, langFa(cfg, userId) ? "❌ عملیات لغو شد." : "❌ Operation cancelled.");
     return;
   }
 
-  // /webapp — open web panel
-  if (cmd === "webapp" || cmd === "panel") {
-    if (cfg.webAppUrl) {
-      await sendPlain(cfg, chatId,
-        langFa(cfg, userId) ? "🌐 پنل ادمین وب:" : "🌐 Web admin panel:",
-        { inline_keyboard: [[{ text: langFa(cfg, userId) ? "🌐 باز کردن پنل" : "🌐 Open Panel", web_app: { url: cfg.webAppUrl } }]] }
-      );
-    } else {
-      await sendPlain(cfg, chatId, langFa(cfg, userId)
-        ? "⚠️ پنل وب تنظیم نشده. WEB_APP_URL را در تنظیمات Worker قرار دهید."
-        : "⚠️ Web panel not configured. Set WEB_APP_URL in the Worker settings.");
-    }
+  // /newpost — start post creation
+  if (cmd === "newpost") {
+    const lang = langFa(cfg, userId) ? "fa" : "en";
+    await setState(env, userId, { action: "post_await_text", lang });
+    const txt = langFa(cfg, userId)
+      ? "📝 **ساخت پست**\n\nمتن پست خود را ارسال کنید (Markdown یا HTML پشتیبانی می‌شود).\n\nبرای لغو /cancel را ارسال کنید."
+      : "📝 **New Post**\n\nSend the text of your post (Markdown or HTML supported).\n\nSend /cancel to abort.";
+    await sendPlain(cfg, chatId, txt);
     return;
   }
 
@@ -2313,128 +2329,6 @@ async function handleCallback(cb, env, cfg) {
     return;
   }
 
-  if (action.startsWith("cal_day_")) {
-    const parts = action.split("_");
-    const year = parseInt(parts[2]);
-    const month = parseInt(parts[3]);
-    const day = parseInt(parts[4]);
-    const selectedDate = new Date(year, month, day);
-    
-    const state = await getState(env, userId);
-    if (!state) return;
-    
-    // Store selected date and show time picker
-    await setState(env, userId, { ...state, action: "schedule_await_time", selectedDate: selectedDate.toISOString() });
-    
-    const dateStr = selectedDate.toLocaleDateString(lang === "fa" ? "fa-IR" : "en-US", { weekday: "long", year: "numeric", month: "long", day: "numeric" });
-    await editRichMarkdown(cfg, chatId, msgId,
-      lang === "fa"
-        ? `📅 **${dateStr}** انتخاب شد!\n\n⏰ ساعت را انتخاب کنید:`
-        : `📅 **${dateStr}** selected!\n\n⏰ Pick a time:`,
-      timePickerKeyboard(lang));
-    return;
-  }
-
-  // ── Time picker handlers ──────────────────────────────────────────────
-  if (action.startsWith("time_quick_")) {
-    const state = await getState(env, userId);
-    if (!state) return;
-    
-    let sendAt;
-    const now = Date.now();
-    
-    if (action === "time_quick_1h") sendAt = now + 3600000;
-    else if (action === "time_quick_2h") sendAt = now + 7200000;
-    else if (action === "time_quick_3h") sendAt = now + 10800000;
-    else if (action === "time_quick_6h") sendAt = now + 21600000;
-    else if (action === "time_quick_tomorrow_9") {
-      const tomorrow = new Date();
-      tomorrow.setDate(tomorrow.getDate() + 1);
-      tomorrow.setHours(9, 0, 0, 0);
-      sendAt = tomorrow.getTime();
-    }
-    else if (action === "time_quick_tomorrow_21") {
-      const tomorrow = new Date();
-      tomorrow.setDate(tomorrow.getDate() + 1);
-      tomorrow.setHours(21, 0, 0, 0);
-      sendAt = tomorrow.getTime();
-    }
-    
-    if (sendAt && state.selectedChannels) {
-      // Schedule the post
-      const post = {
-        id: `post_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-        userId,
-        generatedText: state.text,
-        channelIds: state.selectedChannels,
-        sendAt,
-        sent: false,
-        postState: {
-          text: state.text,
-          buttons: state.buttons,
-          polls: state.polls,
-        },
-      };
-      await addScheduledPost(env, post);
-      await setState(env, userId, null);
-      
-      const dateStr = new Date(sendAt).toLocaleString(lang === "fa" ? "fa-IR" : "en-US");
-      await editRichMarkdown(cfg, chatId, msgId,
-        lang === "fa"
-          ? `✅ **زمان‌بندی شد!**\n\n📅 زمان ارسال: \`${dateStr}\`\n📡 کانال‌ها: ${state.selectedChannels.length}\n🆔 شناسه: \`${post.id}\``
-          : `✅ **Scheduled!**\n\n📅 Send at: \`${dateStr}\`\n📡 Channels: ${state.selectedChannels.length}\n🆔 ID: \`${post.id}\``,
-        mainKeyboard(lang, admin, cfgWithAi));
-    }
-    return;
-  }
-
-  if (action.startsWith("time_")) {
-    const state = await getState(env, userId);
-    if (!state) return;
-    
-    const parts = action.split("_");
-    const hour = parseInt(parts[1]);
-    const minute = parseInt(parts[2] || 0);
-    
-    let sendAt;
-    if (state.selectedDate) {
-      const date = new Date(state.selectedDate);
-      date.setHours(hour, minute, 0, 0);
-      sendAt = date.getTime();
-    } else {
-      const now = new Date();
-      now.setHours(hour, minute, 0, 0);
-      sendAt = now.getTime();
-      if (sendAt < Date.now()) sendAt += 86400000; // Tomorrow if time passed
-    }
-    
-    if (state.selectedChannels) {
-      const post = {
-        id: `post_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-        userId,
-        generatedText: state.text,
-        channelIds: state.selectedChannels,
-        sendAt,
-        sent: false,
-        postState: {
-          text: state.text,
-          buttons: state.buttons,
-          polls: state.polls,
-        },
-      };
-      await addScheduledPost(env, post);
-      await setState(env, userId, null);
-      
-      const dateStr = new Date(sendAt).toLocaleString(lang === "fa" ? "fa-IR" : "en-US");
-      await editRichMarkdown(cfg, chatId, msgId,
-        lang === "fa"
-          ? `✅ **زمان‌بندی شد!**\n\n📅 زمان ارسال: \`${dateStr}\`\n📡 کانال‌ها: ${state.selectedChannels.length}\n🆔 شناسه: \`${post.id}\``
-          : `✅ **Scheduled!**\n\n📅 Send at: \`${dateStr}\`\n📡 Channels: ${state.selectedChannels.length}\n🆔 ID: \`${post.id}\``,
-        mainKeyboard(lang, admin, cfgWithAi));
-    }
-    return;
-  }
-
   // ── AI menu ──────────────────────────────────────────────────────────────
   if (action === "ai_menu") {
     await editRichMarkdown(cfg, chatId, msgId, AI_HELP[lang], aiMenuKeyboard(lang, cfgWithAi));
@@ -2472,6 +2366,13 @@ async function handleCallback(cb, env, cfg) {
       return;
     }
     await editRichMarkdown(cfg, chatId, msgId, AI_CONFIG_HELP[lang], aiConfigMenuKeyboard(lang));
+    return;
+  }
+  if (action === "ai_cancel") {
+    await setState(env, userId, null);
+    await editRichMarkdown(cfg, chatId, msgId, lang === "fa"
+      ? "❌ عملیات لغو شد."
+      : "❌ Operation cancelled.", main);
     return;
   }
   if (action === "ai_config_set") {
@@ -2663,7 +2564,7 @@ async function handleCallback(cb, env, cfg) {
     await editRichMarkdown(cfg, chatId, msgId, POLL_HELP[lang], pollMenuKeyboard(lang));
     return;
   }
-  if (action === "poll_list") {
+  if (action === "pollstats" || action === "poll_list") {
     await showPollStats(env, cfg, chatId, userId, msgId, lang);
     return;
   }
@@ -2893,7 +2794,7 @@ async function handleCallback(cb, env, cfg) {
       
       keyboard = {
         inline_keyboard: [
-          [{ text: lang === "fa" ? "🔹 استفاده از دکمه‌های قبلی" : "🔹 Use saved buttons", callback_data: "fa_use_saved_buttons" }],
+          [{ text: lang === "fa" ? "🔹 استفاده از دکمه‌های قبلی" : "🔹 Use saved buttons", callback_data: `${lang}_use_saved_buttons` }],
           [{ text: lang === "fa" ? "❌ لغو" : "❌ Cancel", callback_data: "fa_cancel_flow" }],
         ],
       };
@@ -3690,37 +3591,40 @@ async function runScheduledPosts(env, cfg, viaHttp) {
           }
         }
 
-        // Send poll if exists
+        // Send polls if exist (array of polls)
         let pollOk = false;
-        if (postState.poll) {
-          const poll = postState.poll;
-          const pollBody = {
-            chat_id: chId,
-            question: poll.question,
-            options: poll.options,
-            is_anonymous: poll.anonymous !== false,
-          };
-          if (poll.type === "quiz") {
-            pollBody.type = "quiz";
-            pollBody.correct_option_id = poll.correctOptionId;
-          }
-          const pollRes = await tg(cfg, "sendPoll", pollBody);
-          pollOk = !!pollRes?.ok;
-
-          if (pollOk) {
-            const pollRecord = {
-              id: `poll_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-              pollId: pollRes.result.poll.id,
+        const polls = postState.polls || (postState.poll ? [postState.poll] : []);
+        for (const poll of polls) {
+          try {
+            const pollBody = {
+              chat_id: chId,
               question: poll.question,
               options: poll.options,
-              chatId: chId,
-              messageId: pollRes.result.message_id,
-              type: poll.type,
-              anonymous: poll.anonymous !== false,
-              correctOptionId: poll.correctOptionId,
-              createdAt: Date.now(),
+              is_anonymous: poll.anonymous !== false,
             };
-            await addPoll(env, pollRecord);
+            if (poll.type === "quiz") {
+              pollBody.type = "quiz";
+              pollBody.correct_option_id = poll.correctOptionId;
+            }
+            const pollRes = await tg(cfg, "sendPoll", pollBody);
+            if (pollRes?.ok) {
+              pollOk = true;
+              const pollRecord = {
+                id: `poll_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+                pollId: pollRes.result.poll.id,
+                question: poll.question,
+                options: poll.options,
+                chatId: chId,
+                messageId: pollRes.result.message_id,
+                type: poll.type,
+                anonymous: poll.anonymous !== false,
+                correctOptionId: poll.correctOptionId,
+                createdAt: Date.now(),
+              };
+              await addPoll(env, pollRecord);
+            }
+          } catch (err) {
+            console.error(`Poll send error: ${err}`);
           }
         }
 
