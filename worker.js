@@ -755,7 +755,6 @@ function mainKeyboard(lang, admin, cfg) {
         { text: "📊 نظرسنجی", callback_data: "fa_standalone_poll_start" },
         { text: "📈 آمار", callback_data: "fa_stats_menu" },
       ],
-      [{ text: "─────────────", callback_data: "noop" }],
     ];
     if (admin) {
       rows.push([
@@ -780,7 +779,6 @@ function mainKeyboard(lang, admin, cfg) {
       { text: "📊 Poll", callback_data: "en_standalone_poll_start" },
       { text: "📈 Stats", callback_data: "en_stats_menu" },
     ],
-    [{ text: "─────────────", callback_data: "noop" }],
   ];
   if (admin) {
     rows.push([
