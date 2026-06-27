@@ -2290,12 +2290,21 @@ async function handleCallback(cb, env, cfg) {
     let sendAt;
     if (state.selectedDate) {
       const date = new Date(state.selectedDate);
-      date.setHours(hour, minute, 0, 0);
-      sendAt = date.getTime();
+      // Convert to Iran date components, set time, convert back to UTC
+      const iranMs = date.getTime() + TIMEZONE_OFFSET_MS;
+      const iranDate = new Date(iranMs);
+      const y = iranDate.getUTCFullYear();
+      const m = iranDate.getUTCMonth();
+      const d = iranDate.getUTCDate();
+      sendAt = Date.UTC(y, m, d, hour, minute, 0, 0) - TIMEZONE_OFFSET_MS;
     } else {
       const now = new Date();
-      now.setHours(hour, minute, 0, 0);
-      sendAt = now.getTime();
+      const iranMs = now.getTime() + TIMEZONE_OFFSET_MS;
+      const iranDate = new Date(iranMs);
+      const y = iranDate.getUTCFullYear();
+      const m = iranDate.getUTCMonth();
+      const d = iranDate.getUTCDate();
+      sendAt = Date.UTC(y, m, d, hour, minute, 0, 0) - TIMEZONE_OFFSET_MS;
       if (sendAt < Date.now()) sendAt += 86400000;
     }
     
