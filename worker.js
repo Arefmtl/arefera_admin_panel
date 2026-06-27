@@ -2269,7 +2269,7 @@ async function handleCallback(cb, env, cfg) {
       await addScheduledPost(env, post);
       await setState(env, userId, null);
       
-      const dateStr = new Date(sendAt).toLocaleString(lang === "fa" ? "fa-IR" : "en-US");
+      const dateStr = new Date(sendAt + TIMEZONE_OFFSET_MS).toLocaleString(lang === "fa" ? "fa-IR" : "en-US");
       await editRichMarkdown(cfg, chatId, msgId,
         lang === "fa"
           ? `✅ **زمان‌بندی شد!**\n\n📅 زمان ارسال: \`${dateStr}\`\n📡 کانال‌ها: ${state.selectedChannels.length}\n🆔 شناسه: \`${post.id}\``
@@ -2326,7 +2326,7 @@ async function handleCallback(cb, env, cfg) {
       await addScheduledPost(env, post);
       await setState(env, userId, null);
       
-      const dateStr = new Date(sendAt).toLocaleString(lang === "fa" ? "fa-IR" : "en-US");
+      const dateStr = new Date(sendAt + TIMEZONE_OFFSET_MS).toLocaleString(lang === "fa" ? "fa-IR" : "en-US");
       await editRichMarkdown(cfg, chatId, msgId,
         lang === "fa"
           ? `✅ **زمان‌بندی شد!**\n\n📅 زمان ارسال: \`${dateStr}\`\n📡 کانال‌ها: ${state.selectedChannels.length}\n🆔 شناسه: \`${post.id}\``
